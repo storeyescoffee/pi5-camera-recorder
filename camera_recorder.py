@@ -65,6 +65,9 @@ class CameraRecorder:
             self.video_naming_pattern = self.config.get("recording", "video_naming_pattern")
             self.local_storage_path = self.config.get("recording", "local_storage_path")
             
+            # Store settings
+            self.store_code = self.config.get("storeyes", "store_code")
+            
             self.logger.info("Camera configuration loaded successfully.")
         except Exception as e:
             self.logger.error(f"Error loading camera configuration: {e}", exc_info=True)
@@ -255,10 +258,10 @@ class CameraRecorder:
             return f"video_{timestamp.strftime('%Y%m%d_%H%M%S')}.mp4"
     
     def _get_folder_structure(self, timestamp: datetime):
-        """Generate hierarchical folder structure: DD-MM-YYYY/HH/"""
-        date_folder = timestamp.strftime('%d-%m-%Y')
+        """Generate hierarchical folder structure: <date>/<store_code>/hour/"""
+        date_folder = timestamp.strftime('%Y-%m-%d')
         hour_folder = timestamp.strftime('%H')
-        return f"{date_folder}/{hour_folder}"
+        return f"{date_folder}/{self.store_code}/{hour_folder}"
     
     def _verify_video_file(self, filepath):
         """Basic verification of video file integrity using PyAV."""
