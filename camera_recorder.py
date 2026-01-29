@@ -258,10 +258,10 @@ class CameraRecorder:
             return f"video_{timestamp.strftime('%Y%m%d_%H%M%S')}.mp4"
     
     def _get_folder_structure(self, timestamp: datetime):
-        """Generate hierarchical folder structure: <date>/<store_code>/hour/"""
+        """Generate hierarchical folder structure: <store_code>/videos/<date_folder>/<hour_folder>"""
         date_folder = timestamp.strftime('%Y-%m-%d')
         hour_folder = timestamp.strftime('%H')
-        return f"{date_folder}/{self.store_code}/{hour_folder}"
+        return f"{self.store_code}/videos/{date_folder}/{hour_folder}"
     
     def _verify_video_file(self, filepath):
         """Basic verification of video file integrity using PyAV."""
