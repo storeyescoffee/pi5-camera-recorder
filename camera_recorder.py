@@ -4,6 +4,7 @@ Camera Recording Module for Raspberry Pi 5
 Handles all camera setup, video recording, and file management.
 """
 
+import csv
 import os
 import time
 import logging
@@ -64,6 +65,7 @@ class CameraRecorder:
             self.recording_duration = int(self.config.get("recording", "duration_minutes"))
             self.video_naming_pattern = self.config.get("recording", "video_naming_pattern")
             self.local_storage_path = self.config.get("recording", "local_storage_path")
+            self.pending_uploads_csv = self.config.get("recording", "pending_uploads_csv", fallback="./pending_uploads.csv")
             
             # Store settings
             self.store_code = self.config.get("storeyes", "store_code")
@@ -73,13 +75,34 @@ class CameraRecorder:
             self.logger.error(f"Error loading camera configuration: {e}", exc_info=True)
             raise
     
+    def _get_pending_local_paths(self):
+        """Return set of normalized local_paths in pending uploads CSV (skip these during cleanup)."""
+        if not os.path.exists(self.pending_uploads_csv):
+            return set()
+        try:
+            paths = set()
+            with open(self.pending_uploads_csv, "r", newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                for row in reader:
+                    p = row.get("local_path", "").strip()
+                    if p:
+                        try:
+                            paths.add(str(Path(p).resolve()))
+                        except (OSError, ValueError):
+                            paths.add(p)
+            return paths
+        except Exception as e:
+            self.logger.warning(f"[CLEANUP] Could not read pending uploads CSV: {e}")
+            return set()
+    
     def _cleanup_old_recordings(self):
-        """Delete all existing video files in the recordings directory on startup."""
+        """Delete all existing video files in the recordings directory on startup. Skips files in pending uploads."""
         try:
             recordings_path = Path(self.local_storage_path)
             if not recordings_path.exists():
                 return
             
+            pending_paths = self._get_pending_local_paths()
             deleted_count = 0
             total_size = 0
             
@@ -88,6 +111,14 @@ class CameraRecorder:
             
             for file_path in recordings_path.iterdir():
                 if file_path.is_file() and file_path.suffix.lower() in video_extensions:
+                    # Skip files pending re-upload
+                    try:
+                        resolved = str(file_path.resolve())
+                    except (OSError, ValueError):
+                        resolved = str(file_path)
+                    if resolved in pending_paths:
+                        self.logger.info(f"[CLEANUP] Skipping pending upload: {file_path.name}")
+                        continue
                     try:
                         file_size = file_path.stat().st_size
                         file_path.unlink()

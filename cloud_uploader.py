@@ -4,6 +4,7 @@ Cloud Upload Module for Raspberry Pi 5 Video Recorder
 Handles all S3/GCS upload functionality with retry logic and concurrent uploads.
 """
 
+import csv
 import os
 import time
 import threading
@@ -30,6 +31,7 @@ class CloudUploader:
         self.upload_threads = []
         self.active_uploads = 0
         self.upload_lock = threading.Lock()
+        self.csv_lock = threading.Lock()
         self.s3_client = None
         
         self._load_config()
@@ -57,6 +59,8 @@ class CloudUploader:
             self.delete_after_upload = self.config.getboolean("recording", "delete_after_upload", fallback=False)
             self.recording_duration = int(self.config.get("recording", "duration_minutes"))
             self.bitrate = int(self.config.get("camera", "bitrate"))
+            self.pending_uploads_csv = self.config.get("recording", "pending_uploads_csv", fallback="./pending_uploads.csv")
+            self.pending_retry_interval_minutes = int(self.config.get("recording", "pending_retry_interval_minutes", fallback="10"))
             
             self.logger.info("Cloud upload configuration loaded successfully.")
             self.logger.info("Using AWS credentials from system default credential chain")
@@ -112,6 +116,42 @@ class CloudUploader:
             self.logger.info("Attempting to reinitialize S3 client...")
             self._init_s3_client(max_retries=3, retry_delay=5)
     
+    def _add_pending_upload(self, local_path, s3_key, filename):
+        """Append failed upload info to CSV for later retry."""
+        with self.csv_lock:
+            try:
+                file_exists = os.path.exists(self.pending_uploads_csv)
+                with open(self.pending_uploads_csv, "a", newline="", encoding="utf-8") as f:
+                    writer = csv.writer(f)
+                    if not file_exists:
+                        writer.writerow(["local_path", "s3_key", "filename", "failed_at"])
+                    writer.writerow([local_path, s3_key, filename, datetime.now().isoformat()])
+                self.logger.info(f"[PENDING] Added to retry list: {filename}")
+            except Exception as e:
+                self.logger.error(f"[PENDING] Failed to write to CSV: {e}", exc_info=True)
+    
+    def _remove_pending_upload(self, local_path):
+        """Remove entry from CSV after successful upload."""
+        with self.csv_lock:
+            try:
+                if not os.path.exists(self.pending_uploads_csv):
+                    return
+                rows = []
+                with open(self.pending_uploads_csv, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    fieldnames = reader.fieldnames or []
+                    for row in reader:
+                        if row.get("local_path") != local_path:
+                            rows.append(row)
+                with open(self.pending_uploads_csv, "w", newline="", encoding="utf-8") as f:
+                    if rows and fieldnames:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(rows)
+                self.logger.debug(f"[PENDING] Removed from retry list: {local_path}")
+            except Exception as e:
+                self.logger.error(f"[PENDING] Failed to update CSV: {e}", exc_info=True)
+    
     def _cleanup_finished_threads(self):
         """Clean up finished upload threads."""
         with self.upload_lock:
@@ -125,12 +165,14 @@ class CloudUploader:
         """Upload file to S3 with retry logic, metadata, and detailed statistics."""
         if self.s3_client is None:
             self.logger.error(f"[UPLOAD] S3 client unavailable, cannot upload {s3_key}")
+            self._add_pending_upload(local_path, s3_key, filename)
             with self.upload_lock:
                 self.active_uploads -= 1
             return
         
         if not os.path.exists(local_path):
             self.logger.error(f"[UPLOAD] File not found: {local_path}")
+            self._remove_pending_upload(local_path)  # Remove stale entry if any
             with self.upload_lock:
                 self.active_uploads -= 1
             return
@@ -167,6 +209,8 @@ class CloudUploader:
                     self.logger.info(f"[UPLOAD] Upload speed: {upload_speed_mbps:.2f} Mbps")
                     self.logger.info(f"[UPLOAD] Average upload rate: {size_mb/dt:.2f} MB/s")
                     
+                    # Remove from pending CSV if it was a retry
+                    self._remove_pending_upload(local_path)
                     # Delete local file after successful upload if configured
                     if self.delete_after_upload:
                         try:
@@ -187,6 +231,7 @@ class CloudUploader:
                         time.sleep(wait_time)
                     else:
                         self.logger.error(f"[UPLOAD] Failed after {max_retries} attempts. File: {local_path}")
+                        self._add_pending_upload(local_path, s3_key, filename)
         finally:
             with self.upload_lock:
                 self.active_uploads -= 1
@@ -227,6 +272,52 @@ class CloudUploader:
         
         upload_thread.start()
         self.logger.info(f"[UPLOAD] Upload thread started for {filename} (Active uploads: {self.active_uploads})")
+    
+    def retry_pending_uploads(self):
+        """Retry all uploads listed in pending_uploads.csv. Removes entries for missing files."""
+        if not os.path.exists(self.pending_uploads_csv):
+            self.logger.info("[PENDING] No pending uploads file found")
+            return 0
+        with self.csv_lock:
+            try:
+                with open(self.pending_uploads_csv, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    rows = list(reader)
+            except Exception as e:
+                self.logger.error(f"[PENDING] Failed to read CSV: {e}", exc_info=True)
+                return 0
+        if not rows:
+            return 0
+        self.logger.info(f"[PENDING] Retrying {len(rows)} pending upload(s)...")
+        count = 0
+        remaining = []
+        for row in rows:
+            local_path = row.get("local_path", "")
+            s3_key = row.get("s3_key", "")
+            filename = row.get("filename", os.path.basename(local_path))
+            if not local_path or not s3_key:
+                continue
+            if os.path.exists(local_path):
+                self.upload_file(local_path, s3_key, filename)
+                count += 1
+            else:
+                self.logger.warning(f"[PENDING] Skipping missing file, removing from list: {local_path}")
+                self._remove_pending_upload(local_path)
+        if count > 0:
+            self.wait_for_uploads(timeout=600)
+        return count
+    
+    def get_pending_local_paths(self):
+        """Return set of local_paths currently in pending CSV (for cleanup skip list)."""
+        if not os.path.exists(self.pending_uploads_csv):
+            return set()
+        with self.csv_lock:
+            try:
+                with open(self.pending_uploads_csv, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    return {row.get("local_path", "") for row in reader if row.get("local_path")}
+            except Exception:
+                return set()
     
     def estimate_file_size_and_upload_time(self, upload_speed_mbps=10):
         """Estimate file size and upload time based on configuration."""

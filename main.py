@@ -25,9 +25,12 @@ class VideoRecorder:
         # Setup logging with file handler
         self._setup_logging()
         
-        # Initialize camera recorder and cloud uploader
-        self.camera_recorder = CameraRecorder(self.config, self.logger)
+        # Initialize cloud uploader first (before camera) for pending retry
         self.cloud_uploader = CloudUploader(self.config, self.logger)
+        self.cloud_uploader.retry_pending_uploads()
+        
+        # Initialize camera recorder (cleanup will skip pending upload files)
+        self.camera_recorder = CameraRecorder(self.config, self.logger)
         
     def _setup_logging(self):
         """Setup logging with both console and date-based file logging."""
@@ -111,6 +114,8 @@ class VideoRecorder:
         consecutive_errors = 0
         max_consecutive_errors = 10
         error_backoff = 5  # seconds
+        last_pending_retry = time.time()
+        retry_interval_sec = self.cloud_uploader.pending_retry_interval_minutes * 60
         
         try:
             while True:
@@ -127,6 +132,11 @@ class VideoRecorder:
                                 time.sleep(60)  # Wait 1 minute before trying again
                                 consecutive_errors = 0
                             continue
+                    
+                    # Periodic retry of pending uploads
+                    if retry_interval_sec > 0 and (time.time() - last_pending_retry) >= retry_interval_sec:
+                        self.cloud_uploader.retry_pending_uploads()
+                        last_pending_retry = time.time()
                     
                     # Attempt to record
                     success, local_path, s3_key, filename = self.camera_recorder.record_video(
