@@ -51,7 +51,8 @@ class CloudUploader:
         """Load cloud storage configuration."""
         try:
             self.endpoint_url = self.config.get("gcs", "endpoint_url")
-            self.bucket_name = self.config.get("gcs", "bucket_name")
+            bl = self.config.get("gcs", "bucket_location", fallback="").strip()
+            self.bucket_name = bl.split("/", 1)[0] if bl else self.config.get("gcs", "bucket_name")
             self.region = self.config.get("gcs", "region", fallback="us-east-1")
             
             # Recording settings needed for upload

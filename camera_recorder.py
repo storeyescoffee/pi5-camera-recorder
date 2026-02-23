@@ -72,6 +72,13 @@ class CameraRecorder:
             
             # Store settings
             self.store_code = self.config.get("storeyes", "store_code")
+            # bucket_location: s3://<bucket_location>/{date}/{hour}/{filename}; first segment = bucket, rest = key prefix
+            if self.config.has_section("gcs"):
+                bl = self.config.get("gcs", "bucket_location", fallback="").strip()
+                bn = self.config.get("gcs", "bucket_name", fallback="")
+                self.bucket_location = bl or f"{bn}/videos" if bn else "videos"
+            else:
+                self.bucket_location = "videos"
             
             self.logger.info("Camera configuration loaded successfully.")
         except Exception as e:
@@ -370,11 +377,17 @@ class CameraRecorder:
             self.logger.error(f"Error generating filename: {e}", exc_info=True)
             return f"video_{timestamp.strftime('%Y%m%d_%H%M%S')}.mp4"
     
-    def _get_folder_structure(self, timestamp: datetime):
-        """Generate hierarchical folder structure: <store_code>/videos/<date_folder>/<hour_folder>"""
+    def _get_s3_key_prefix(self, timestamp: datetime):
+        """
+        Generate S3 key: s3://<bucket_location>/{date}/{hour}/{filename}
+        bucket_location = bucket + optional prefix (e.g. storeyes-videos/recordings).
+        """
+        bl = getattr(self, "bucket_location", "videos")
+        parts = bl.split("/", 1)
+        key_prefix = parts[1] if len(parts) > 1 else ""
         date_folder = timestamp.strftime('%Y-%m-%d')
         hour_folder = timestamp.strftime('%H')
-        return f"{self.store_code}/videos/{date_folder}/{hour_folder}"
+        return f"{key_prefix}/{date_folder}/{hour_folder}" if key_prefix else f"{date_folder}/{hour_folder}"
     
     def _verify_video_file(self, filepath):
         """Basic verification of video file integrity using PyAV."""
@@ -452,8 +465,8 @@ class CameraRecorder:
             ts = datetime.now()
             filename = self._generate_filename(ts)
             local_path = os.path.join(self.local_storage_path, filename)
-            folder_structure = self._get_folder_structure(ts)
-            s3_key = f"{folder_structure}/{filename}"
+            key_prefix = self._get_s3_key_prefix(ts)
+            s3_key = f"{key_prefix}/{filename}"
 
             self.logger.info(f"[RECORD] Starting recording: {filename}")
             self.logger.info(f"[RECORD] Color format: {'BGR888 (no conversion)' if getattr(self, 'use_bgr_format', False) else 'RGB888 (with conversion)'}")
