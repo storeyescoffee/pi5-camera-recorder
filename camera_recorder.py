@@ -435,7 +435,7 @@ class CameraRecorder:
         bl = getattr(self, "bucket_location", "videos")
         parts = bl.split("/", 1)
         key_prefix = parts[1] if len(parts) > 1 else ""
-        date_folder = timestamp.strftime('%Y-%m-%d')
+        date_folder = timestamp.strftime('%d-%m-%Y')
         hour_folder = timestamp.strftime('%H')
         return f"{key_prefix}/{date_folder}/{hour_folder}" if key_prefix else f"{date_folder}/{hour_folder}"
     
