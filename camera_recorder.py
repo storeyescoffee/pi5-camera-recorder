@@ -32,7 +32,8 @@ class CameraRecorder:
         self.config = config
         self.logger = logger or self._setup_logging()
         self.camera = None
-        
+        self._recording_count = 0  # For periodic camera reinitialization
+
         self._load_config()
         Path(self.local_storage_path).mkdir(parents=True, exist_ok=True)
         
@@ -66,6 +67,8 @@ class CameraRecorder:
             self.video_naming_pattern = self.config.get("recording", "video_naming_pattern")
             self.local_storage_path = self.config.get("recording", "local_storage_path")
             self.pending_uploads_csv = self.config.get("recording", "pending_uploads_csv", fallback="./pending_uploads.csv")
+            self.post_stop_delay_seconds = float(self.config.get("recording", "post_stop_delay_seconds", fallback="1.5"))
+            self.periodic_camera_reinit_recordings = int(self.config.get("recording", "periodic_camera_reinit_recordings", fallback="0"))
             
             # Store settings
             self.store_code = self.config.get("storeyes", "store_code")
@@ -268,6 +271,85 @@ class CameraRecorder:
             self.logger.info("Attempting to reinitialize camera...")
             return self._setup_camera(max_retries=3, retry_delay=5)
         return True
+
+    def _full_camera_reset(self):
+        """
+        Perform a complete camera reset: stop, close, and destroy the instance.
+        Ensures pipeline and buffers are fully released. Sets self.camera = None.
+        """
+        self.logger.info("[RECOVERY] Performing full camera reset...")
+        if self.camera is None:
+            return
+        try:
+            try:
+                self.camera.stop_recording()
+            except Exception:
+                pass
+        except Exception:
+            pass
+        try:
+            self.camera.stop()
+        except Exception:
+            pass
+        try:
+            self.camera.close()
+        except Exception:
+            pass
+        self.camera = None
+        time.sleep(1.0)
+        self.logger.info("[RECOVERY] Full camera reset complete")
+
+    def _safe_stop_recording(self):
+        """
+        Stop recording with defensive error handling, then wait for buffers to release.
+        Call this instead of camera.stop_recording() directly.
+        """
+        if self.camera is None:
+            return
+        try:
+            self.camera.stop_recording()
+        except Exception as e:
+            self.logger.warning(f"[RECORD] Error during stop_recording: {e}")
+        finally:
+            delay = getattr(self, "post_stop_delay_seconds", 1.5)
+            time.sleep(delay)
+
+    def _safe_start_recording(self, enc, out, local_path):
+        """
+        Safe wrapper for start_recording. Handles Broken pipe and encoder state issues.
+        On failure: performs full camera reset, reinitializes camera, returns False.
+        Caller MUST create a NEW encoder before retry - never reuse a failed encoder.
+
+        Args:
+            enc: H264Encoder instance
+            out: FfmpegOutput instance
+            local_path: Output file path (for logging)
+
+        Returns:
+            bool: True if recording started successfully, False otherwise
+        """
+        try:
+            self.camera.start_recording(enc, out)
+            return True
+        except RuntimeError as e:
+            err_str = str(e).lower()
+            if "broken pipe" in err_str or "encoder already running" in err_str or "failed to start camera" in err_str:
+                self.logger.error(f"[RECORD] Camera/encoder error during start_recording: {e}")
+                self._full_camera_reset()
+                if not self._setup_camera(max_retries=3, retry_delay=5):
+                    return False
+                return False
+            raise
+        except Exception as e:
+            self.logger.error(f"[RECORD] Unexpected error during start_recording: {e}", exc_info=True)
+            try:
+                self.camera.stop_recording()
+            except Exception:
+                pass
+            self._full_camera_reset()
+            if not self._setup_camera(max_retries=3, retry_delay=5):
+                return False
+            return False
     
     def _generate_filename(self, timestamp: datetime):
         """Generate filename supporting all placeholders with error handling."""
@@ -345,10 +427,11 @@ class CameraRecorder:
     def record_video(self, upload_callback=None):
         """
         Record one video and optionally trigger upload callback.
-        
+        Uses safe start/stop helpers for production-stable 24/7 continuous recording.
+
         Args:
             upload_callback: Optional callback function(local_path, s3_key, filename) to handle upload
-        
+
         Returns:
             tuple: (success: bool, local_path: str, s3_key: str, filename: str) or (False, None, None, None)
         """
@@ -357,52 +440,54 @@ class CameraRecorder:
             if not self._reinit_camera():
                 self.logger.error("[RECORD] Cannot record: camera unavailable")
                 return False, None, None, None
-        
+
+        reinit_interval = getattr(self, "periodic_camera_reinit_recordings", 0)
+        if reinit_interval > 0 and self._recording_count > 0 and self._recording_count % reinit_interval == 0:
+            self.logger.info(f"[RECORD] Periodic camera reinit (every {reinit_interval} recordings)")
+            self._full_camera_reset()
+            if not self._setup_camera(max_retries=3, retry_delay=5):
+                return False, None, None, None
+
         try:
             ts = datetime.now()
             filename = self._generate_filename(ts)
             local_path = os.path.join(self.local_storage_path, filename)
             folder_structure = self._get_folder_structure(ts)
             s3_key = f"{folder_structure}/{filename}"
-            
+
             self.logger.info(f"[RECORD] Starting recording: {filename}")
             self.logger.info(f"[RECORD] Color format: {'BGR888 (no conversion)' if getattr(self, 'use_bgr_format', False) else 'RGB888 (with conversion)'}")
             self.logger.info(f"[RECORD] Recording {self.recording_duration * 60}s at {self.fps}fps using native PiCamera2 recording...")
-            
+
             enc = H264Encoder(bitrate=self.bitrate)
             out = FfmpegOutput(local_path)
-            
+
             recording_start_time = time.time()
             duration_seconds = self.recording_duration * 60
-            
-            # Start recording with error handling
-            try:
-                self.camera.start_recording(enc, out)
-            except Exception as e:
-                self.logger.error(f"[RECORD] Failed to start recording: {e}", exc_info=True)
-                if not self._reinit_camera():
-                    return False, None, None, None
-                try:
-                    self.camera.start_recording(enc, out)
-                except Exception as e2:
-                    self.logger.error(f"[RECORD] Retry failed: {e2}", exc_info=True)
-                    return False, None, None, None
-            
+
+            # Safe start: never reuse a failed encoder
+            started = self._safe_start_recording(enc, out, local_path)
+            if not started:
+                self.logger.info("[RECORD] Retrying with fresh encoder after full camera reset...")
+                enc = H264Encoder(bitrate=self.bitrate)
+                out = FfmpegOutput(local_path)
+                started = self._safe_start_recording(enc, out, local_path)
+            if not started:
+                self.logger.error("[RECORD] Failed to start recording after retry")
+                return False, None, None, None
+
             # Record for the specified duration
             try:
                 time.sleep(duration_seconds)
             except KeyboardInterrupt:
                 self.logger.info("[RECORD] Recording interrupted by user")
                 raise
-            
-            # Stop recording
-            try:
-                self.camera.stop_recording()
-                actual_duration = time.time() - recording_start_time
-                self.logger.info(f"[RECORD] Native recording completed: {filename}")
-                self.logger.info(f"[RECORD] Target duration: {duration_seconds}s, Actual duration: {actual_duration:.1f}s")
-            except Exception as e:
-                self.logger.error(f"[RECORD] Error stopping recording: {e}", exc_info=True)
+
+            # Safe stop with buffer release delay
+            self._safe_stop_recording()
+            actual_duration = time.time() - recording_start_time
+            self.logger.info(f"[RECORD] Native recording completed: {filename}")
+            self.logger.info(f"[RECORD] Target duration: {duration_seconds}s, Actual duration: {actual_duration:.1f}s")
             
             # Verify file integrity
             is_valid, message = self._verify_video_file(local_path)
@@ -412,11 +497,13 @@ class CameraRecorder:
             
             file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
             self.logger.info(f"[RECORD] Recording completed: {filename} ({file_size_mb:.1f} MB) - {message}")
-            
+
+            self._recording_count += 1
+
             # Call upload callback if provided
             if upload_callback and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
                 upload_callback(local_path, s3_key, filename)
-            
+
             return True, local_path, s3_key, filename
             
         except KeyboardInterrupt:
