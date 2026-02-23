@@ -5,17 +5,66 @@ Handles all camera setup, video recording, and file management.
 """
 
 import csv
+import gc
 import os
+import signal
+import subprocess
 import time
 import logging
 from datetime import datetime
 from pathlib import Path
 import numpy as np
 import av
+import prctl
 from picamera2 import Picamera2, MappedArray
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import FfmpegOutput
 import libcamera
+
+
+class FfmpegOutputLargeQueue(FfmpegOutput):
+    """
+    FfmpegOutput with raised thread_queue_size to avoid
+    "Thread message queue blocking; consider raising the thread_queue_size" warnings.
+    Default 64 is too low when CPU is busy (e.g. during parallel S3 uploads).
+    """
+
+    def __init__(self, output_filename, video_thread_queue_size=512, **kwargs):
+        super().__init__(output_filename, **kwargs)
+        self._video_thread_queue_size = video_thread_queue_size
+
+    def start(self):
+        general_options = ['-loglevel', 'warning', '-y']
+        video_input = [
+            '-use_wallclock_as_timestamps', '1',
+            '-thread_queue_size', str(self._video_thread_queue_size),
+            '-i', '-'
+        ]
+        video_codec = ['-c:v', 'copy']
+        audio_input = []
+        audio_codec = []
+        if self.audio:
+            audio_input = [
+                '-itsoffset', str(self.audio_sync),
+                '-f', 'pulse',
+                '-sample_rate', str(self.audio_samplerate),
+                '-thread_queue_size', '1024',
+                '-i', self.audio_device
+            ]
+            audio_codec = ['-b:a', str(self.audio_bitrate), '-c:a', self.audio_codec]
+            if self.audio_filter:
+                audio_codec.extend(['-af', self.audio_filter])
+
+        command = (
+            ['ffmpeg'] + general_options + audio_input + video_input +
+            audio_codec + video_codec + self.output_filename.split()
+        )
+        self.ffmpeg = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            preexec_fn=lambda: prctl.set_pdeathsig(signal.SIGKILL)
+        )
+        super(FfmpegOutput, self).start()
 
 
 class CameraRecorder:
@@ -69,6 +118,7 @@ class CameraRecorder:
             self.pending_uploads_csv = self.config.get("recording", "pending_uploads_csv", fallback="./pending_uploads.csv")
             self.post_stop_delay_seconds = float(self.config.get("recording", "post_stop_delay_seconds", fallback="1.5"))
             self.periodic_camera_reinit_recordings = int(self.config.get("recording", "periodic_camera_reinit_recordings", fallback="0"))
+            self.ffmpeg_video_thread_queue_size = int(self.config.get("recording", "ffmpeg_video_thread_queue_size", fallback="512"))
             
             # Store settings
             self.store_code = self.config.get("storeyes", "store_code")
@@ -473,7 +523,8 @@ class CameraRecorder:
             self.logger.info(f"[RECORD] Recording {self.recording_duration * 60}s at {self.fps}fps using native PiCamera2 recording...")
 
             enc = H264Encoder(bitrate=self.bitrate)
-            out = FfmpegOutput(local_path)
+            queue_size = getattr(self, "ffmpeg_video_thread_queue_size", 512)
+            out = FfmpegOutputLargeQueue(local_path, video_thread_queue_size=queue_size)
 
             recording_start_time = time.time()
             duration_seconds = self.recording_duration * 60
@@ -483,7 +534,7 @@ class CameraRecorder:
             if not started:
                 self.logger.info("[RECORD] Retrying with fresh encoder after full camera reset...")
                 enc = H264Encoder(bitrate=self.bitrate)
-                out = FfmpegOutput(local_path)
+                out = FfmpegOutputLargeQueue(local_path, video_thread_queue_size=queue_size)
                 started = self._safe_start_recording(enc, out, local_path)
             if not started:
                 self.logger.error("[RECORD] Failed to start recording after retry")
