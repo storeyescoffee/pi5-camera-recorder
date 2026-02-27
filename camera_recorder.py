@@ -234,14 +234,9 @@ class CameraRecorder:
         """Configure PiCamera2 with retry logic and intelligent format selection."""
         for attempt in range(1, max_retries + 1):
             try:
-                # Clean up previous camera instance if exists
-                if self.camera is not None:
-                    try:
-                        self.camera.stop()
-                        self.camera.close()
-                    except:
-                        pass
-                    self.camera = None
+                # Clean up previous camera instance; use full reset for thorough release
+                self._full_camera_reset()
+                gc.collect()
                 
                 self.camera = Picamera2()
                 frame_duration_us = int(1_000_000 / self.fps)
@@ -257,7 +252,7 @@ class CameraRecorder:
                                 "AnalogueGain": self.analog_gain,
                                 "FrameDurationLimits": (frame_duration_us, frame_duration_us),
                             },
-                            transform=libcamera.Transform(rotate=180) if self.reverse_camera else libcamera.Transform()
+                            transform=libcamera.Transform(rotation=180) if self.reverse_camera else libcamera.Transform()
                         )
                         self.camera.configure(video_config)
                         self.use_bgr_format = (self.force_color_format == "BGR888")
@@ -277,7 +272,7 @@ class CameraRecorder:
                                 "AeEnable": True,
                                 "AeFlickerPeriod": 10000
                             },
-                            transform=libcamera.Transform(rotate=180) if self.reverse_camera else libcamera.Transform()
+                            transform=libcamera.Transform(rotation=180) if self.reverse_camera else libcamera.Transform()
                         )
                         self.camera.configure(video_config)
                         self.use_bgr_format = True
@@ -292,7 +287,7 @@ class CameraRecorder:
                                 "AnalogueGain": self.analog_gain,
                                 "FrameDurationLimits": (frame_duration_us, frame_duration_us),
                             },
-                            transform=libcamera.Transform(rotate=180) if self.reverse_camera else libcamera.Transform()
+                            transform=libcamera.Transform(rotation=180) if self.reverse_camera else libcamera.Transform()
                         )
                         self.camera.configure(video_config)
                         self.use_bgr_format = False
@@ -314,12 +309,15 @@ class CameraRecorder:
                 return True
             except Exception as e:
                 self.logger.error(f"Camera setup failed (attempt {attempt}/{max_retries}): {e}", exc_info=True)
+                self.camera = None
+                gc.collect()
                 if attempt < max_retries:
-                    self.logger.info(f"Retrying camera setup in {retry_delay} seconds...")
-                    time.sleep(retry_delay)
+                    err_str = str(e).lower()
+                    delay = 15 if ("resource busy" in err_str or "did not complete" in err_str) else retry_delay
+                    self.logger.info(f"Retrying camera setup in {delay} seconds...")
+                    time.sleep(delay)
                 else:
                     self.logger.error("Failed to setup camera after all retries.")
-                    self.camera = None
                     return False
     
     def _reinit_camera(self):
@@ -353,7 +351,8 @@ class CameraRecorder:
         except Exception:
             pass
         self.camera = None
-        time.sleep(1.0)
+        gc.collect()
+        time.sleep(2.5)
         self.logger.info("[RECOVERY] Full camera reset complete")
 
     def _safe_stop_recording(self):
