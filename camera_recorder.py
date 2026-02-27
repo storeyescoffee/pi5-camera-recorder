@@ -110,6 +110,7 @@ class CameraRecorder:
             self.fps = int(self.config.get("camera", "fps"))
             self.bitrate = int(self.config.get("camera", "bitrate"))
             self.force_color_format = self.config.get("camera", "force_color_format", fallback=None)
+            self.reverse_camera = self.config.getboolean("camera", "reverse_camera", fallback=True)
             
             # Recording settings
             self.recording_duration = int(self.config.get("recording", "duration_minutes"))
@@ -120,8 +121,6 @@ class CameraRecorder:
             self.periodic_camera_reinit_recordings = int(self.config.get("recording", "periodic_camera_reinit_recordings", fallback="0"))
             self.ffmpeg_video_thread_queue_size = int(self.config.get("recording", "ffmpeg_video_thread_queue_size", fallback="512"))
             
-            # Store settings
-            self.store_code = self.config.get("storeyes", "store_code")
             # bucket_location: s3://<bucket_location>/{date}/{hour}/{filename}; first segment = bucket, rest = key prefix
             if self.config.has_section("gcs"):
                 bl = self.config.get("gcs", "bucket_location", fallback="").strip()
@@ -258,7 +257,7 @@ class CameraRecorder:
                                 "AnalogueGain": self.analog_gain,
                                 "FrameDurationLimits": (frame_duration_us, frame_duration_us),
                             },
-                            transform=libcamera.Transform(rotate=180)
+                            transform=libcamera.Transform(rotate=180) if self.reverse_camera else libcamera.Transform()
                         )
                         self.camera.configure(video_config)
                         self.use_bgr_format = (self.force_color_format == "BGR888")
@@ -278,7 +277,7 @@ class CameraRecorder:
                                 "AeEnable": True,
                                 "AeFlickerPeriod": 10000
                             },
-                            transform=libcamera.Transform(rotate=180)
+                            transform=libcamera.Transform(rotate=180) if self.reverse_camera else libcamera.Transform()
                         )
                         self.camera.configure(video_config)
                         self.use_bgr_format = True
@@ -293,13 +292,14 @@ class CameraRecorder:
                                 "AnalogueGain": self.analog_gain,
                                 "FrameDurationLimits": (frame_duration_us, frame_duration_us),
                             },
+                            transform=libcamera.Transform(rotate=180) if self.reverse_camera else libcamera.Transform()
                         )
                         self.camera.configure(video_config)
                         self.use_bgr_format = False
                         self.logger.info("Using RGB888 format - color conversion will be applied")
                 
-                # attach rotation callback
-                self.camera.post_callback = self.rotate_180_callback
+                # attach rotation callback if reverse enabled
+                self.camera.post_callback = self.rotate_180_callback if self.reverse_camera else None
                 self.camera.start()
                 
                 # Check and display supported formats for debugging
