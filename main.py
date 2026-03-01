@@ -4,6 +4,7 @@ Raspberry Pi 5 Video Recorder with Automatic AWS S3 Region Detection
 and Flexible Filename Placeholders
 """
 
+import json
 import time
 import configparser
 import logging
@@ -11,8 +12,25 @@ from datetime import datetime
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
 
+CACHE_SETTINGS_PATH = Path("cache/settings.json")
+
+
+def _get_pi_serial_id():
+    """Read Raspberry Pi serial ID from /proc/cpuinfo."""
+    try:
+        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("Serial"):
+                    return line.split(":", 1)[1].strip()
+    except (OSError, IndexError):
+        pass
+    return ""
+
+
 from camera_recorder import CameraRecorder
 from cloud_uploader import CloudUploader
+from api_client import create_api_client
+from mqtt_client import MqttSyncClient
 
 
 class VideoRecorder:
@@ -24,6 +42,9 @@ class VideoRecorder:
 
         # Setup logging with file handler
         self._setup_logging()
+
+        # Fetch and apply store settings from API (if configured)
+        self._apply_store_settings()
         
         # Initialize cloud uploader first (before camera) for pending retry
         self.cloud_uploader = CloudUploader(self.config, self.logger)
@@ -31,6 +52,10 @@ class VideoRecorder:
         
         # Initialize camera recorder (cleanup will skip pending upload files)
         self.camera_recorder = CameraRecorder(self.config, self.logger)
+
+        # Start MQTT sync-settings listener if BROKER and device_id available
+        self.mqtt_client = None
+        self._start_mqtt_sync()
         
     def _setup_logging(self):
         """Setup logging with both console and date-based file logging."""
@@ -74,6 +99,107 @@ class VideoRecorder:
         self.logger.addHandler(console_handler)
         
         self.logger.info(f"Logging initialized. Log file: {log_filename}")
+
+    def _apply_store_settings(self):
+        """Fetch store settings from API and merge into config. Uses cache/settings.json as fallback on API error."""
+        api_client = create_api_client(self.config, self.logger)
+        settings = None
+        if api_client:
+            settings = api_client.get_store_settings()
+            if settings:
+                try:
+                    CACHE_SETTINGS_PATH.parent.mkdir(parents=True, exist_ok=True)
+                    with open(CACHE_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                        json.dump(settings, f, indent=2)
+                except Exception as e:
+                    self.logger.warning(f"[STORE] Failed to save settings cache: {e}")
+        if not settings and CACHE_SETTINGS_PATH.exists():
+            try:
+                with open(CACHE_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+                self.logger.info("[STORE] Using cached settings (API unavailable)")
+            except Exception as e:
+                self.logger.warning(f"[STORE] Failed to load settings cache: {e}")
+        if not settings:
+            return
+        try:
+            if "RECORDING" in settings:
+                rec = settings["RECORDING"]
+                if "s3-location" in rec:
+                    loc = str(rec["s3-location"]).strip()
+                    if loc.startswith("s3://"):
+                        loc = loc[5:]  # strip s3://
+                    self.config.set("gcs", "bucket_location", loc)
+                    self.logger.info(f"[STORE] Applied s3-location: {loc}")
+                if "chunk-duration" in rec:
+                    self.config.set("recording", "duration_minutes", str(rec["chunk-duration"]))
+                    self.logger.info(f"[STORE] Applied chunk-duration: {rec['chunk-duration']}")
+            if "REGISTER" in settings and "delta-time" in settings["REGISTER"]:
+                dt = settings["REGISTER"]["delta-time"]
+                if not self.config.has_section("register"):
+                    self.config.add_section("register")
+                self.config.set("register", "delta_time", str(dt))
+                self.logger.info(f"[STORE] Applied register delta-time: {dt}")
+            if "CAMERA" in settings:
+                cam = settings["CAMERA"]
+                if "shutter-speed" in cam:
+                    self.config.set("camera", "shutter_speed", str(cam["shutter-speed"]))
+                    self.logger.info(f"[STORE] Applied shutter-speed: {cam['shutter-speed']}")
+                if "analog-gain" in cam:
+                    self.config.set("camera", "analog_gain", str(cam["analog-gain"]))
+                    self.logger.info(f"[STORE] Applied analog-gain: {cam['analog-gain']}")
+                if "bitrate" in cam:
+                    self.config.set("camera", "bitrate", str(cam["bitrate"]))
+                    self.logger.info(f"[STORE] Applied bitrate: {cam['bitrate']}")
+                if "flip" in cam:
+                    flip_val = str(cam["flip"]).lower() in ("true", "1", "yes")
+                    self.config.set("camera", "reverse_camera", str(flip_val))
+                    self.logger.info(f"[STORE] Applied flip (reverse_camera): {flip_val}")
+        except Exception as e:
+            self.logger.warning(f"[STORE] Failed to apply settings: {e}", exc_info=True)
+
+    def _on_sync_settings(self):
+        """Called when MQTT sync-settings message received: refetch and apply, then reload components."""
+        self.logger.info("[STORE] Sync-settings triggered, refetching and applying...")
+        self._apply_store_settings()
+        self.camera_recorder.reload_settings()
+        self.cloud_uploader.reload_settings()
+
+    def _start_mqtt_sync(self):
+        """Start MQTT client to subscribe to sync-settings if BROKER and device_id available."""
+        device_id = self.config.get("api", "device_id", fallback="").strip() if self.config.has_section("api") else ""
+        if not device_id:
+            device_id = _get_pi_serial_id()
+        if not device_id:
+            return
+        broker = {}
+        if CACHE_SETTINGS_PATH.exists():
+            try:
+                with open(CACHE_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                    settings = json.load(f)
+                broker = settings.get("BROKER", {})
+            except Exception as e:
+                self.logger.warning(f"[MQTT] Could not read broker from cache: {e}")
+        host = broker.get("host", "").strip()
+        port = broker.get("port", "1883")
+        username = broker.get("username", "").strip()
+        password = broker.get("password", "").strip()
+        if not host or not username:
+            self.logger.info("[MQTT] BROKER not in store settings, sync-settings disabled")
+            return
+        self.mqtt_client = MqttSyncClient(
+            host=host,
+            port=port,
+            username=username,
+            password=password,
+            device_id=device_id,
+            on_sync_callback=self._on_sync_settings,
+            logger=self.logger,
+        )
+        if self.mqtt_client.start():
+            self.logger.info("[MQTT] Sync-settings listener started")
+        else:
+            self.mqtt_client = None
     
     def record_single_video(self):
         """Record a single video."""
@@ -183,6 +309,9 @@ class VideoRecorder:
     def cleanup(self):
         """Cleanup resources and wait for uploads to finish."""
         try:
+            if self.mqtt_client:
+                self.mqtt_client.stop()
+                self.mqtt_client = None
             # Cleanup camera
             self.camera_recorder.cleanup()
             # Cleanup uploads

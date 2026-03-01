@@ -133,6 +133,11 @@ class CameraRecorder:
         except Exception as e:
             self.logger.error(f"Error loading camera configuration: {e}", exc_info=True)
             raise
+
+    def reload_settings(self):
+        """Reload configuration from config (e.g. after sync-settings MQTT message)."""
+        self._load_config()
+        self.logger.info("[STORE] Camera settings reloaded")
     
     def _get_pending_local_paths(self):
         """Return set of normalized local_paths in pending uploads CSV (skip these during cleanup)."""
