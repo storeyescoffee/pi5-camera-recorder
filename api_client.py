@@ -192,7 +192,7 @@ class ApiClient:
                 "CAMERA": {"shutter-speed": "...", "analog-gain": "...", "bitrate": "...", "flip": "..."}
             }
         """
-        ok, resp, _ = self._request("GET", "/api/device-gw/settings")
+        ok, resp, _ = self._request("GET", "/device-gw/settings")
         if not ok or not isinstance(resp, dict):
             return None
         self.logger.info(f"[API] GET store settings OK")
