@@ -181,7 +181,7 @@ class ApiClient:
 
     def get_store_settings(self):
         """
-        GET store settings from /device-gw/settings/store.
+        GET store settings from /api/device-gw/settings.
 
         Returns:
             dict or None: Parsed payload on success, None on failure.
@@ -192,7 +192,7 @@ class ApiClient:
                 "CAMERA": {"shutter-speed": "...", "analog-gain": "...", "bitrate": "...", "flip": "..."}
             }
         """
-        ok, resp, _ = self._request("GET", "/device-gw/settings/store")
+        ok, resp, _ = self._request("GET", "/api/device-gw/settings")
         if not ok or not isinstance(resp, dict):
             return None
         self.logger.info(f"[API] GET store settings OK")
