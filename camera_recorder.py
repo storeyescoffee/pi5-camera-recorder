@@ -101,9 +101,9 @@ class CameraRecorder:
         return logger
     
     def _load_config(self):
-        """Load camera and recording configuration."""
+        """Load camera and recording configuration. CAMERA/RECORDING from API/cache only."""
         try:
-            # Camera settings
+            # Camera settings (from store settings API/cache only)
             self.analog_gain = float(self.config.get("camera", "analog_gain"))
             self.shutter_speed = int(self.config.get("camera", "shutter_speed"))
             self.resolution_width = int(self.config.get("camera", "resolution_width"))
@@ -111,9 +111,9 @@ class CameraRecorder:
             self.fps = int(self.config.get("camera", "fps"))
             self.bitrate = int(self.config.get("camera", "bitrate"))
             self.force_color_format = self.config.get("camera", "force_color_format", fallback=None)
-            self.reverse_camera = self.config.getboolean("camera", "reverse_camera", fallback=True)
+            self.reverse_camera = self.config.getboolean("camera", "reverse_camera")
             
-            # Recording settings
+            # Recording settings (from store settings API/cache only)
             self.recording_duration = int(self.config.get("recording", "duration_minutes"))
             self.video_naming_pattern = self.config.get("recording", "video_naming_pattern")
             self.local_storage_path = self.config.get("recording", "local_storage_path")
@@ -122,13 +122,8 @@ class CameraRecorder:
             self.periodic_camera_reinit_recordings = int(self.config.get("recording", "periodic_camera_reinit_recordings", fallback="0"))
             self.ffmpeg_video_thread_queue_size = int(self.config.get("recording", "ffmpeg_video_thread_queue_size", fallback="512"))
             
-            # bucket_location: s3://<bucket_location>/{date}/{hour}/{filename}; first segment = bucket, rest = key prefix
-            if self.config.has_section("gcs"):
-                bl = self.config.get("gcs", "bucket_location", fallback="").strip()
-                bn = self.config.get("gcs", "bucket_name", fallback="")
-                self.bucket_location = bl or f"{bn}/videos" if bn else "videos"
-            else:
-                self.bucket_location = "videos"
+            # bucket_location from RECORDING.s3-location (API/cache only)
+            self.bucket_location = self.config.get("gcs", "bucket_location").strip()
             
             self.logger.info("Camera configuration loaded successfully.")
         except Exception as e:

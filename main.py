@@ -121,7 +121,9 @@ class VideoRecorder:
             except Exception as e:
                 self.logger.warning(f"[STORE] Failed to load settings cache: {e}")
         if not settings:
-            return
+            raise RuntimeError(
+                "Store settings required from API or cache. API unreachable and cache/settings.json missing or invalid."
+            )
         try:
             if "RECORDING" in settings:
                 rec = settings["RECORDING"]
@@ -155,6 +157,16 @@ class VideoRecorder:
                     flip_val = str(cam["flip"]).lower() in ("true", "1", "yes")
                     self.config.set("camera", "reverse_camera", str(flip_val))
                     self.logger.info(f"[STORE] Applied flip (reverse_camera): {flip_val}")
+            if "AWS" in settings:
+                for key, val in settings["AWS"].items():
+                    if not self.config.has_section("aws"):
+                        self.config.add_section("aws")
+                    self.config.set("aws", key.replace("-", "_"), str(val))
+            if "MAIL" in settings:
+                for key, val in settings["MAIL"].items():
+                    if not self.config.has_section("mail"):
+                        self.config.add_section("mail")
+                    self.config.set("mail", key.replace("-", "_"), str(val))
         except Exception as e:
             self.logger.warning(f"[STORE] Failed to apply settings: {e}", exc_info=True)
 
@@ -391,13 +403,84 @@ class VideoRecorder:
             self.logger.error(f"[CLEANUP] Error during cleanup: {e}", exc_info=True)
 
 
+def _run_test(config_file="config.conf"):
+    """Check API and S3 connectivity, show all settings."""
+    config = configparser.ConfigParser()
+    config.read(config_file)
+    print("\n=== Pi Video Recorder - Connectivity Test ===\n")
+
+    # API test
+    api_client = create_api_client(config, None)
+    settings = None
+    api_ok = False
+    if api_client:
+        settings = api_client.get_store_settings()
+        api_ok = settings is not None
+    if not settings and CACHE_SETTINGS_PATH.exists():
+        try:
+            with open(CACHE_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                settings = json.load(f)
+        except Exception:
+            pass
+    print(f"API:  {'OK' if api_ok else 'FAILED (using cache)' if settings else 'FAILED'}")
+
+    # S3 test
+    s3_ok = False
+    if settings:
+        try:
+            rec = settings.get("RECORDING", {})
+            loc = str(rec.get("s3-location", "")).strip()
+            if loc.startswith("s3://"):
+                loc = loc[5:]
+            bucket = loc.split("/", 1)[0] if loc else None
+            if bucket:
+                import boto3
+                from botocore.client import Config
+                client = boto3.client("s3", region_name="us-east-1", config=Config(signature_version="s3v4"))
+                region_resp = client.get_bucket_location(Bucket=bucket)
+                region = region_resp.get("LocationConstraint") or "us-east-1"
+                regional = boto3.client("s3", region_name=region, config=Config(signature_version="s3v4"))
+                regional.head_bucket(Bucket=bucket)
+                s3_ok = True
+                print(f"S3:   OK (bucket={bucket}, region={region})")
+            else:
+                print("S3:   SKIPPED (no s3-location in settings)")
+        except Exception as e:
+            print(f"S3:   FAILED - {e}")
+    else:
+        print("S3:   SKIPPED (no settings)")
+
+    # Show settings (mask sensitive)
+    if settings:
+        print("\n--- Settings ---")
+        _mask = {"password", "secret-key", "access-key", "secret_key", "access_key"}
+        def _mask_dict(d):
+            out = {}
+            for k, v in d.items():
+                key = k.replace("-", "_").lower()
+                if any(m in key for m in _mask) and isinstance(v, str) and len(v) > 4:
+                    out[k] = "***"
+                elif isinstance(v, dict):
+                    out[k] = _mask_dict(v)
+                else:
+                    out[k] = v
+            return out
+        print(json.dumps(_mask_dict(settings), indent=2))
+    print("\n===========================================\n")
+    return 0 if (settings and (api_ok or s3_ok)) else 1
+
+
 def main():
     import argparse
     parser = argparse.ArgumentParser(description="Pi Video Recorder Uploader")
     parser.add_argument("--config", default="config.conf", help="Configuration file path")
     parser.add_argument("--single", action="store_true", help="Record single video instead of continuous")
+    parser.add_argument("--test", action="store_true", help="Test API and S3 connectivity, show settings")
     args = parser.parse_args()
-    
+
+    if args.test:
+        return _run_test(args.config)
+
     try:
         recorder = VideoRecorder(args.config)
         
