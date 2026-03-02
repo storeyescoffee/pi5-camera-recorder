@@ -9,7 +9,7 @@ import os
 import time
 import threading
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import boto3
 from botocore.client import Config
 
@@ -204,11 +204,12 @@ class CloudUploader:
             if finished_threads:
                 self.logger.debug(f"[CLEANUP] Removed {len(finished_threads)} finished upload threads")
     
-    def _upload_worker(self, local_path, s3_key, filename, max_retries=3, is_fallback=False, existing_video_code=None):
+    def _upload_worker(self, local_path, s3_key, filename, max_retries=3, is_fallback=False, existing_video_code=None, start_time=None):
         """Upload file to S3 with retry logic, metadata, and detailed statistics.
 
         is_fallback: True when retrying from pending CSV.
         existing_video_code: From CSV when POST succeeded but upload failed (scenario 1).
+        start_time: Recording start time (datetime); if None, derived from file mtime - duration for retries.
         """
         if self.s3_client is None:
             self.logger.error(f"[UPLOAD] S3 client unavailable, cannot upload {s3_key}")
@@ -228,6 +229,10 @@ class CloudUploader:
             file_size = os.path.getsize(local_path)
             duration_seconds = self.recording_duration * 60
             video_code = existing_video_code
+            # Derive start_time from file mtime if not provided (e.g. retry from pending)
+            if start_time is None:
+                mtime = os.path.getmtime(local_path)
+                start_time = datetime.fromtimestamp(mtime) - timedelta(seconds=duration_seconds)
 
             if is_fallback:
                 if video_code:
@@ -238,13 +243,13 @@ class CloudUploader:
                     # Scenario 2: Internet was down, POST failed. Resend POST.
                     if self.api_client:
                         video_url = self._build_video_url(s3_key)
-                        video_code = self.api_client.post_main_video(video_url, file_size, duration_seconds)
+                        video_code = self.api_client.post_main_video(video_url, file_size, duration_seconds, start_time, hour=start_time.hour)
                         if not video_code:
                             self.logger.warning("[API] POST main-video failed on retry")
             elif self.api_client:
                 # Normal flow: POST first
                 video_url = self._build_video_url(s3_key)
-                video_code = self.api_client.post_main_video(video_url, file_size, duration_seconds)
+                video_code = self.api_client.post_main_video(video_url, file_size, duration_seconds, start_time, hour=start_time.hour)
                 if not video_code:
                     self.logger.warning("[API] POST main-video failed, continuing upload without backend notification")
 
@@ -314,7 +319,7 @@ class CloudUploader:
                 self.active_uploads -= 1
                 self.logger.info(f"[UPLOAD] Upload thread finished for {filename}")
     
-    def upload_file(self, local_path, s3_key, filename, is_fallback=False, video_code=None):
+    def upload_file(self, local_path, s3_key, filename, is_fallback=False, video_code=None, start_time=None):
         """
         Queue a file for upload.
 
@@ -324,6 +329,7 @@ class CloudUploader:
             filename: Filename for logging
             is_fallback: True when retrying from pending CSV
             video_code: From CSV when POST succeeded but upload failed (scenario 1)
+            start_time: Recording start time (datetime); if None, derived from file mtime - duration
         """
         if self.s3_client is None:
             self.logger.warning(f"[UPLOAD] S3 client unavailable, skipping upload for {filename}")
@@ -340,7 +346,7 @@ class CloudUploader:
         upload_thread = threading.Thread(
             target=self._upload_worker,
             args=(local_path, s3_key, filename),
-            kwargs={"is_fallback": is_fallback, "existing_video_code": video_code or None},
+            kwargs={"is_fallback": is_fallback, "existing_video_code": video_code or None, "start_time": start_time},
             daemon=True,
             name=f"Upload-{filename}"
         )

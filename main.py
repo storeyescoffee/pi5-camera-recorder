@@ -158,12 +158,83 @@ class VideoRecorder:
         except Exception as e:
             self.logger.warning(f"[STORE] Failed to apply settings: {e}", exc_info=True)
 
-    def _on_sync_settings(self):
-        """Called when MQTT sync-settings message received: refetch and apply, then reload components."""
-        self.logger.info("[STORE] Sync-settings triggered, refetching and applying...")
+    def _on_sync_settings(self, payload=None):
+        """Called when MQTT sync-settings message received.
+        If payload is JSON with name and value: apply single setting (optimized).
+        Else: full sync from API."""
+        if payload:
+            try:
+                data = json.loads(payload) if isinstance(payload, str) else payload
+                name = data.get("name")
+                value = data.get("value")
+                if name is not None and value is not None:
+                    self._apply_single_setting(str(name), value)
+                    return
+            except (json.JSONDecodeError, TypeError, AttributeError):
+                pass
+        # Fallback: full sync
+        self.logger.info("[STORE] Sync-settings triggered, full sync from API...")
         self._apply_store_settings()
-        self.camera_recorder.reload_settings()
+        self.camera_recorder.reload_settings(force_camera_reinit=True)
         self.cloud_uploader.reload_settings()
+
+    # Setting name -> (config section, config key, value transform, camera_reinit, cloud_reload)
+    _SETTING_ACTIONS = {
+        # Camera hardware - need reinit
+        "shutter-speed": ("camera", "shutter_speed", lambda v: str(v), True, False),
+        "analog-gain": ("camera", "analog_gain", lambda v: str(v), True, False),
+        "flip": ("camera", "reverse_camera", lambda v: str(str(v).lower() in ("true", "1", "yes")), True, False),
+        # Camera/encoder - no reinit, applies on next recording
+        "bitrate": ("camera", "bitrate", lambda v: str(v), False, False),
+        # Recording - applies on next recording
+        "chunk-duration": ("recording", "duration_minutes", lambda v: str(v), False, False),
+        "s3-location": ("gcs", "bucket_location", lambda v: str(v).strip()[5:] if str(v).strip().startswith("s3://") else str(v), False, True),
+        # Register
+        "delta-time": ("register", "delta_time", lambda v: str(v), False, False),
+    }
+
+    def _apply_single_setting(self, name, value):
+        """Apply a single setting by name and value. Uses targeted action per setting."""
+        action = self._SETTING_ACTIONS.get(name)
+        if not action:
+            self.logger.warning(f"[STORE] Unknown setting name: {name}")
+            return
+        section, key, transform, camera_reinit, cloud_reload = action
+        try:
+            config_value = transform(value)
+            if not self.config.has_section(section):
+                self.config.add_section(section)
+            self.config.set(section, key, config_value)
+            self.logger.info(f"[STORE] Applied {name}={config_value}")
+        except Exception as e:
+            self.logger.warning(f"[STORE] Failed to apply {name}: {e}")
+            return
+        # Update cache so it reflects the new value (for restart fallback)
+        self._update_cache_single(name, value)
+        self.camera_recorder.reload_settings(force_camera_reinit=camera_reinit)
+        if cloud_reload:
+            self.cloud_uploader.reload_settings()
+
+    def _update_cache_single(self, name, value):
+        """Merge single setting into cache/settings.json."""
+        name_to_api = {"shutter-speed": ("CAMERA", "shutter-speed"), "analog-gain": ("CAMERA", "analog-gain"),
+                      "flip": ("CAMERA", "flip"), "bitrate": ("CAMERA", "bitrate"),
+                      "chunk-duration": ("RECORDING", "chunk-duration"), "s3-location": ("RECORDING", "s3-location"),
+                      "delta-time": ("REGISTER", "delta-time")}
+        path = name_to_api.get(name)
+        if not path or not CACHE_SETTINGS_PATH.exists():
+            return
+        try:
+            with open(CACHE_SETTINGS_PATH, "r", encoding="utf-8") as f:
+                cache = json.load(f)
+            api_section, api_key = path
+            if api_section not in cache:
+                cache[api_section] = {}
+            cache[api_section][api_key] = str(value)
+            with open(CACHE_SETTINGS_PATH, "w", encoding="utf-8") as f:
+                json.dump(cache, f, indent=2)
+        except Exception as e:
+            self.logger.debug(f"[STORE] Could not update cache: {e}")
 
     def _start_mqtt_sync(self):
         """Start MQTT client to subscribe to sync-settings if BROKER and device_id available."""

@@ -82,6 +82,7 @@ class CameraRecorder:
         self.logger = logger or self._setup_logging()
         self.camera = None
         self._recording_count = 0  # For periodic camera reinitialization
+        self._pending_camera_reinit = False  # Set by reload_settings(); reinit before next recording
 
         self._load_config()
         Path(self.local_storage_path).mkdir(parents=True, exist_ok=True)
@@ -134,10 +135,16 @@ class CameraRecorder:
             self.logger.error(f"Error loading camera configuration: {e}", exc_info=True)
             raise
 
-    def reload_settings(self):
-        """Reload configuration from config (e.g. after sync-settings MQTT message)."""
+    def reload_settings(self, force_camera_reinit=True):
+        """Reload configuration from config (e.g. after sync-settings MQTT message).
+        If force_camera_reinit, marks camera for reinit so hardware settings (shutter, gain, flip)
+        apply on next recording. Otherwise only in-memory config is updated."""
         self._load_config()
-        self.logger.info("[STORE] Camera settings reloaded")
+        if force_camera_reinit:
+            self._pending_camera_reinit = True
+            self.logger.info("[STORE] Camera settings reloaded (camera will reinit before next recording)")
+        else:
+            self.logger.info("[STORE] Camera settings reloaded (applies on next recording)")
     
     def _get_pending_local_paths(self):
         """Return set of normalized local_paths in pending uploads CSV (skip these during cleanup)."""
@@ -509,6 +516,14 @@ class CameraRecorder:
                 self.logger.error("[RECORD] Cannot record: camera unavailable")
                 return False, None, None, None
 
+        # Reinit camera if settings were synced (shutter, gain, flip need hardware reconfig)
+        if self._pending_camera_reinit:
+            self.logger.info("[RECORD] Settings synced, reinitializing camera for new hardware config...")
+            self._full_camera_reset()
+            if not self._setup_camera(max_retries=3, retry_delay=5):
+                return False, None, None, None
+            self._pending_camera_reinit = False
+
         reinit_interval = getattr(self, "periodic_camera_reinit_recordings", 0)
         if reinit_interval > 0 and self._recording_count > 0 and self._recording_count % reinit_interval == 0:
             self.logger.info(f"[RECORD] Periodic camera reinit (every {reinit_interval} recordings)")
@@ -569,9 +584,9 @@ class CameraRecorder:
 
             self._recording_count += 1
 
-            # Call upload callback if provided
+            # Call upload callback if provided (ts = recording start time)
             if upload_callback and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
-                upload_callback(local_path, s3_key, filename)
+                upload_callback(local_path, s3_key, filename, start_time=ts)
 
             return True, local_path, s3_key, filename
             

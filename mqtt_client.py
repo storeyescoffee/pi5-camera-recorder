@@ -27,7 +27,7 @@ class MqttSyncClient:
             username: MQTT username
             password: MQTT password
             device_id: Device identifier for topic storeyes/<device_id>/sync-settings
-            on_sync_callback: Callable with no args, invoked when sync message received
+            on_sync_callback: Callable(msg_payload) - payload as bytes or str, invoked when sync message received
             logger: Optional logger
         """
         self.host = host
@@ -74,9 +74,12 @@ class MqttSyncClient:
 
     def _on_message(self, client, userdata, msg):
         topic = msg.topic
+        payload = msg.payload
+        if isinstance(payload, bytes):
+            payload = payload.decode("utf-8", errors="replace")
         self.logger.info(f"[MQTT] sync-settings message received on {topic}")
         try:
-            self.on_sync_callback()
+            self.on_sync_callback(payload)
         except Exception as e:
             self.logger.error(f"[MQTT] sync callback error: {e}", exc_info=True)
 

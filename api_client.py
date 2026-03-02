@@ -109,7 +109,7 @@ class ApiClient:
             self.logger.error(f"[API] {method} {path} error: {e}", exc_info=True)
             return False, None, 0
 
-    def post_main_video(self, video_url, filesize, duration, video_code=None):
+    def post_main_video(self, video_url, filesize, duration, start_time=None, hour=None, video_code=None):
         """
         POST initial video state when upload starts.
 
@@ -117,6 +117,8 @@ class ApiClient:
             video_url: Full video URL (required, max 1024 chars)
             filesize: File size in bytes (required)
             duration: Duration in seconds (required)
+            start_time: Recording start time (datetime or ISO str); required by backend
+            hour: Hour of day 0-23 (int); if None and start_time is datetime, derived from start_time
             video_code: Optional UUID; if omitted, server generates one
 
         Returns:
@@ -133,6 +135,15 @@ class ApiClient:
             "filesize": int(filesize),
             "duration": int(duration),
         }
+        if start_time is not None:
+            if hasattr(start_time, "isoformat"):
+                payload["startTime"] = start_time.isoformat()
+            else:
+                payload["startTime"] = str(start_time)
+        if hour is not None:
+            payload["hour"] = int(hour)
+        elif start_time is not None and hasattr(start_time, "hour"):
+            payload["hour"] = int(start_time.hour)
 
         ok, resp, _ = self._request("POST", "/device-gw/main-videos", payload)
         if not ok:
