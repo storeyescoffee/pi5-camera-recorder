@@ -21,5 +21,6 @@ if ! kill -0 "$pid" 2>/dev/null; then
   exit 0
 fi
 
-kill "$pid"
-echo "Sent SIGTERM to $pid (PID from $PID_FILE)"
+kill -KILL "$pid"
+rm -f "$PID_FILE"
+echo "Sent SIGKILL to $pid"
