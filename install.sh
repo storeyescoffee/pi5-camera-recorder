@@ -12,3 +12,5 @@ sudo apt install -y \
 CRON_LINE='@reboot cd $HOME/pi5-camera-recorder && python3 main.py'
 (crontab -l 2>/dev/null | grep -Fv "$CRON_LINE"; echo "$CRON_LINE") | crontab -
 
+# Make start.sh and stop.sh executable
+chmod +x start.sh stop.sh
