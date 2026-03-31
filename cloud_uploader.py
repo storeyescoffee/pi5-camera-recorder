@@ -41,6 +41,33 @@ class CloudUploader:
         self._load_config()
         self._init_s3_client()
     
+    def _get_aws_credentials_kwargs(self):
+        """Return boto3 credential kwargs from config, if provided.
+
+        Supports settings API keys copied into config section [aws]:
+        - access_key / access-key
+        - secret_key / secret-key
+        - session_token / session-token (optional)
+        """
+        if not self.config.has_section("aws"):
+            return {}
+        # video_recorder copies API keys with '-' replaced by '_', but accept both for robustness.
+        access_key = (self.config.get("aws", "access_key", fallback="") or self.config.get("aws", "access-key", fallback="")).strip()
+        secret_key = (self.config.get("aws", "secret_key", fallback="") or self.config.get("aws", "secret-key", fallback="")).strip()
+        session_token = (self.config.get("aws", "session_token", fallback="") or self.config.get("aws", "session-token", fallback="")).strip()
+
+        if access_key and secret_key:
+            out = {"aws_access_key_id": access_key, "aws_secret_access_key": secret_key}
+            if session_token:
+                out["aws_session_token"] = session_token
+            return out
+        return {}
+
+    def _get_aws_default_region(self):
+        if not self.config.has_section("aws"):
+            return ""
+        return (self.config.get("aws", "default_region", fallback="") or self.config.get("aws", "default-region", fallback="")).strip()
+
     def _setup_logging(self):
         """Setup logging if not provided."""
         logger = logging.getLogger(__name__)
@@ -70,7 +97,11 @@ class CloudUploader:
             self.video_url_base = self.config.get("api", "video_url_base", fallback="").strip() if self.config.has_section("api") else ""
             
             self.logger.info("Cloud upload configuration loaded successfully.")
-            self.logger.info("Using AWS credentials from system default credential chain")
+            creds = self._get_aws_credentials_kwargs()
+            if creds:
+                self.logger.info("Using AWS credentials from store settings ([aws] section)")
+            else:
+                self.logger.info("Using AWS credentials from system default credential chain")
         except Exception as e:
             self.logger.error(f"Error loading cloud upload configuration: {e}", exc_info=True)
             raise
@@ -83,15 +114,18 @@ class CloudUploader:
     def _init_s3_client(self, max_retries=5, retry_delay=10):
         """Create S3 client with automatic region detection and retry logic.
         
-        Uses AWS default credential chain (environment variables, IAM roles, ~/.aws/credentials).
+        Uses AWS credentials from config [aws] if present, otherwise AWS default credential chain
+        (environment variables, IAM roles, ~/.aws/credentials).
         """
         for attempt in range(1, max_retries + 1):
             try:
-                # Use default credential chain - no explicit credentials needed
+                creds = self._get_aws_credentials_kwargs()
+                base_region = self._get_aws_default_region() or "us-east-1"
                 base_client = boto3.client(
                     "s3",
-                    region_name="us-east-1",
-                    config=Config(signature_version="s3v4")
+                    region_name=base_region,
+                    config=Config(signature_version="s3v4"),
+                    **creds,
                 )
                 
                 region_resp = base_client.get_bucket_location(Bucket=self.bucket_name)
@@ -101,12 +135,12 @@ class CloudUploader:
                 endpoint = f"https://s3.{actual_region}.amazonaws.com"
                 self.logger.info(f"Using regional S3 endpoint: {endpoint}")
                 
-                # Use default credential chain - no explicit credentials needed
                 self.s3_client = boto3.client(
                     "s3",
                     endpoint_url=endpoint,
                     region_name=actual_region,
-                    config=Config(signature_version="s3v4")
+                    config=Config(signature_version="s3v4"),
+                    **creds,
                 )
                 self.s3_region = actual_region
                 

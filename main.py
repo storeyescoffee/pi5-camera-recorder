@@ -46,10 +46,22 @@ def _run_test(config_file="config.conf"):
             if bucket:
                 import boto3
                 from botocore.client import Config
-                client = boto3.client("s3", region_name="us-east-1", config=Config(signature_version="s3v4"))
+                # Prefer credentials from config [aws] (store settings), else boto3 default chain.
+                access_key = config.get("aws", "access_key", fallback="").strip() if config.has_section("aws") else ""
+                secret_key = config.get("aws", "secret_key", fallback="").strip() if config.has_section("aws") else ""
+                session_token = config.get("aws", "session_token", fallback="").strip() if config.has_section("aws") else ""
+                default_region = config.get("aws", "default_region", fallback="").strip() if config.has_section("aws") else ""
+                creds = {}
+                if access_key and secret_key:
+                    creds = {"aws_access_key_id": access_key, "aws_secret_access_key": secret_key}
+                    if session_token:
+                        creds["aws_session_token"] = session_token
+                base_region = default_region or "us-east-1"
+
+                client = boto3.client("s3", region_name=base_region, config=Config(signature_version="s3v4"), **creds)
                 region_resp = client.get_bucket_location(Bucket=bucket)
                 region = region_resp.get("LocationConstraint") or "us-east-1"
-                regional = boto3.client("s3", region_name=region, config=Config(signature_version="s3v4"))
+                regional = boto3.client("s3", region_name=region, config=Config(signature_version="s3v4"), **creds)
                 regional.head_bucket(Bucket=bucket)
                 s3_ok = True
                 print(f"S3:   OK (bucket={bucket}, region={region})")
