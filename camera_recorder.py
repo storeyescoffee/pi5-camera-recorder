@@ -70,7 +70,7 @@ class FfmpegOutputLargeQueue(FfmpegOutput):
 class CameraRecorder:
     """Handles camera setup and video recording functionality."""
     
-    def __init__(self, config, logger=None):
+    def __init__(self, config, logger=None, imx500_overlay=False):
         """
         Initialize CameraRecorder.
         
@@ -81,6 +81,7 @@ class CameraRecorder:
         self.config = config
         self.logger = logger or self._setup_logging()
         self.camera = None
+        self.imx500_overlay = bool(imx500_overlay)
         self._recording_count = 0  # For periodic camera reinitialization
         self._pending_camera_reinit = False  # Set by reload_settings(); reinit before next recording
 
@@ -236,6 +237,136 @@ class CameraRecorder:
         with MappedArray(request, "main") as m:
             # 180° rotation = flip both axes (flip vertically and horizontally)
             m.array[:] = np.flip(np.flip(m.array, axis=0), axis=1)
+
+    def _extract_imx500_boxes(self, metadata):
+        """Best-effort extraction of bounding boxes from IMX500 metadata.
+
+        Returns a list of boxes in either:
+        - (x1, y1, x2, y2) absolute pixels
+        - (x, y, w, h) absolute pixels
+        Values may also be normalized floats; caller should normalize if needed.
+        """
+        if not isinstance(metadata, dict) or not metadata:
+            return []
+
+        # Common candidate locations (different IMX500 pipelines expose different keys)
+        candidates = []
+        for k in ("imx500", "IMX500", "Imx500", "Objects", "objects", "detections", "Detections"):
+            v = metadata.get(k)
+            if v is not None:
+                candidates.append(v)
+
+        # Also scan for any top-level key containing 'imx500'
+        for k, v in metadata.items():
+            if isinstance(k, str) and "imx500" in k.lower():
+                candidates.append(v)
+
+        def _as_list(x):
+            if x is None:
+                return []
+            if isinstance(x, list):
+                return x
+            if isinstance(x, dict):
+                # Some formats embed list under known keys
+                for key in ("objects", "detections", "boxes", "bboxes", "results"):
+                    if key in x and isinstance(x[key], list):
+                        return x[key]
+            return []
+
+        items = []
+        for c in candidates:
+            items.extend(_as_list(c))
+
+        boxes = []
+        for it in items:
+            if isinstance(it, dict):
+                # (xmin, ymin, xmax, ymax)
+                if all(k in it for k in ("xmin", "ymin", "xmax", "ymax")):
+                    boxes.append((it["xmin"], it["ymin"], it["xmax"], it["ymax"]))
+                    continue
+                # (x, y, w, h)
+                if all(k in it for k in ("x", "y", "w", "h")):
+                    boxes.append((it["x"], it["y"], it["w"], it["h"]))
+                    continue
+                # Alternate naming
+                if all(k in it for k in ("x", "y", "width", "height")):
+                    boxes.append((it["x"], it["y"], it["width"], it["height"]))
+                    continue
+                if "bbox" in it and isinstance(it["bbox"], (list, tuple)) and len(it["bbox"]) == 4:
+                    boxes.append(tuple(it["bbox"]))
+                    continue
+            elif isinstance(it, (list, tuple)) and len(it) == 4:
+                boxes.append(tuple(it))
+        return boxes
+
+    def _draw_rect(self, img, x1, y1, x2, y2, color, thickness=2):
+        """Draw rectangle border directly into HxWxC numpy array."""
+        h, w = img.shape[0], img.shape[1]
+        x1 = max(0, min(w - 1, int(x1)))
+        x2 = max(0, min(w - 1, int(x2)))
+        y1 = max(0, min(h - 1, int(y1)))
+        y2 = max(0, min(h - 1, int(y2)))
+        if x2 <= x1 or y2 <= y1:
+            return
+
+        t = max(1, int(thickness))
+        # top
+        img[y1:y1 + t, x1:x2 + 1] = color
+        # bottom
+        img[y2 - t + 1:y2 + 1, x1:x2 + 1] = color
+        # left
+        img[y1:y2 + 1, x1:x1 + t] = color
+        # right
+        img[y1:y2 + 1, x2 - t + 1:x2 + 1] = color
+
+    def imx500_overlay_callback(self, request):
+        """Runs on every captured frame BEFORE encoding. Draws IMX500 bounding boxes if present."""
+        try:
+            md = request.get_metadata() if hasattr(request, "get_metadata") else {}
+        except Exception:
+            md = {}
+        boxes = self._extract_imx500_boxes(md)
+        if not boxes:
+            return
+
+        with MappedArray(request, "main") as m:
+            img = m.array
+            h, w = img.shape[0], img.shape[1]
+
+            # Green is (0,255,0) in both RGB and BGR.
+            color = np.array([0, 255, 0], dtype=img.dtype)
+
+            for b in boxes:
+                if not isinstance(b, (list, tuple)) or len(b) != 4:
+                    continue
+                a, c, d, e = b
+                try:
+                    a = float(a); c = float(c); d = float(d); e = float(e)
+                except Exception:
+                    continue
+
+                # Heuristic: if all are in 0..1 range, treat as normalized.
+                normalized = 0.0 <= a <= 1.0 and 0.0 <= c <= 1.0 and 0.0 <= d <= 1.0 and 0.0 <= e <= 1.0
+
+                # Interpret either (x1,y1,x2,y2) or (x,y,w,h)
+                # If values look like widths/heights (smallish), treat as x,y,w,h.
+                if normalized:
+                    # normalized x/y/w/h is common
+                    x = a * w
+                    y = c * h
+                    ww = d * w
+                    hh = e * h
+                    x1, y1, x2, y2 = x, y, x + ww, y + hh
+                else:
+                    # Decide based on whether (d,e) look like max coords or sizes
+                    if d > a and e > c and (d <= w + 1) and (e <= h + 1):
+                        # likely x1,y1,x2,y2 (already pixels)
+                        x1, y1, x2, y2 = a, c, d, e
+                    else:
+                        # treat as x,y,w,h (pixels)
+                        x1, y1, x2, y2 = a, c, a + d, c + e
+
+                self._draw_rect(img, x1, y1, x2, y2, color=color, thickness=2)
     
     def _setup_camera(self, max_retries=5, retry_delay=5):
         """Configure PiCamera2 with retry logic and intelligent format selection."""
@@ -300,9 +431,8 @@ class CameraRecorder:
                         self.use_bgr_format = False
                         self.logger.info("Using RGB888 format - color conversion will be applied")
                 
-                # No post_callback for rotation - libcamera.Transform(hflip=True, vflip=True) handles 180°
-                # (Using both would double-flip = no visible rotation)
-                self.camera.post_callback = None
+                # Optional per-frame overlay (runs before encoding).
+                self.camera.post_callback = self.imx500_overlay_callback if self.imx500_overlay else None
                 self.camera.start()
                 
                 # Check and display supported formats for debugging
@@ -313,6 +443,8 @@ class CameraRecorder:
                 self.logger.info(f"Analog gain: {self.analog_gain}, Shutter speed: {self.shutter_speed}μs")
                 self.logger.info(f"Bitrate: {self.bitrate/1_000_000:.1f}Mbps")
                 self.logger.info(f"Color format: {'BGR888 (no conversion)' if getattr(self, 'use_bgr_format', False) else 'RGB888 (with conversion)'}")
+                if self.imx500_overlay:
+                    self.logger.info("[IMX500] Overlay enabled (will draw boxes when metadata is present)")
                 time.sleep(2)
                 return True
             except Exception as e:

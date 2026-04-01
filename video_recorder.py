@@ -31,9 +31,10 @@ def _get_pi_serial_id():
 class VideoRecorder:
     """Main orchestrator class that combines camera recording and cloud upload functionality."""
 
-    def __init__(self, config_file="config.conf"):
+    def __init__(self, config_file="config.conf", imx500_overlay=False):
         self.config = configparser.ConfigParser()
         self.config.read(config_file)
+        self.imx500_overlay = bool(imx500_overlay)
 
         # Setup logging with file handler
         self._setup_logging()
@@ -46,7 +47,7 @@ class VideoRecorder:
         self.cloud_uploader.retry_pending_uploads()
 
         # Initialize camera recorder (cleanup will skip pending upload files)
-        self.camera_recorder = CameraRecorder(self.config, self.logger)
+        self.camera_recorder = CameraRecorder(self.config, self.logger, imx500_overlay=self.imx500_overlay)
 
         # Start MQTT sync-settings listener if BROKER and device_id available
         self.mqtt_client = None

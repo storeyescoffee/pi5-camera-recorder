@@ -98,6 +98,7 @@ def main():
     parser.add_argument("--config", default="config.conf", help="Configuration file path")
     parser.add_argument("--single", action="store_true", help="Record single video instead of continuous")
     parser.add_argument("--test", action="store_true", help="Test API and S3 connectivity, show settings")
+    parser.add_argument("--imx500", action="store_true", help="Overlay IMX500 bounding boxes on recorded frames (if metadata is present)")
     args = parser.parse_args()
 
     if args.test:
@@ -107,7 +108,7 @@ def main():
     try:
         pid_file.write_text(str(os.getpid()), encoding="utf-8")
         try:
-            recorder = VideoRecorder(args.config)
+            recorder = VideoRecorder(args.config, imx500_overlay=args.imx500)
 
             if args.single:
                 recorder.record_single_video()
