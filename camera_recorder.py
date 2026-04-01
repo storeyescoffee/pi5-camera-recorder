@@ -82,6 +82,9 @@ class CameraRecorder:
         self.logger = logger or self._setup_logging()
         self.camera = None
         self.imx500_overlay = bool(imx500_overlay)
+        self._imx500 = None
+        self._imx500_intrinsics = None
+        self._imx500_last_results = []
         self._recording_count = 0  # For periodic camera reinitialization
         self._pending_camera_reinit = False  # Set by reload_settings(); reinit before next recording
 
@@ -113,6 +116,12 @@ class CameraRecorder:
             self.bitrate = int(self.config.get("camera", "bitrate"))
             self.force_color_format = self.config.get("camera", "force_color_format", fallback=None)
             self.reverse_camera = self.config.getboolean("camera", "reverse_camera")
+            self.imx500_model = self.config.get(
+                "camera",
+                "imx500_model",
+                fallback="/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk",
+            ).strip()
+            self.imx500_threshold = float(self.config.get("camera", "imx500_threshold", fallback="0.55"))
             
             # Recording settings (from store settings API/cache only)
             self.recording_duration = int(self.config.get("recording", "duration_minutes"))
@@ -325,48 +334,69 @@ class CameraRecorder:
             md = request.get_metadata() if hasattr(request, "get_metadata") else {}
         except Exception:
             md = {}
-        boxes = self._extract_imx500_boxes(md)
-        if not boxes:
+
+        # IMX500 metadata does not usually contain ready-to-draw boxes; you must decode tensors
+        # via the IMX500 helper (see picamera2 IMX500 demos).
+        detections = []
+        if self._imx500 is not None and self._imx500_intrinsics is not None:
+            try:
+                np_outputs = self._imx500.get_outputs(md, add_batch=True)
+                if np_outputs is None:
+                    detections = self._imx500_last_results
+                else:
+                    intr = self._imx500_intrinsics
+                    threshold = float(getattr(self, "imx500_threshold", 0.55))
+                    input_w, input_h = self._imx500.get_input_size()
+
+                    # Standard object-detection models output (boxes, scores, classes)
+                    boxes, scores, classes = np_outputs[0][0], np_outputs[1][0], np_outputs[2][0]
+
+                    if getattr(intr, "bbox_normalization", False):
+                        # Demos normalize by input_h (model input height)
+                        boxes = boxes / input_h
+
+                    if getattr(intr, "bbox_order", "yx") == "xy":
+                        boxes = boxes[:, [1, 0, 3, 2]]
+
+                    detections = []
+                    for box, score, category in zip(boxes, scores, classes):
+                        try:
+                            if float(score) < threshold:
+                                continue
+                        except Exception:
+                            continue
+                        try:
+                            x, y, w, h = self._imx500.convert_inference_coords(box, md, self.camera)
+                            detections.append((x, y, w, h, float(score), int(category)))
+                        except Exception:
+                            continue
+                    self._imx500_last_results = detections
+            except Exception:
+                # Fall back to best-effort parsing below.
+                detections = []
+
+        if not detections:
+            boxes = self._extract_imx500_boxes(md)
+            for b in boxes:
+                if isinstance(b, (list, tuple)) and len(b) == 4:
+                    try:
+                        a, c, d, e = map(float, b)
+                        detections.append((a, c, d, e, None, None))
+                    except Exception:
+                        pass
+
+        if not detections:
             return
 
         with MappedArray(request, "main") as m:
             img = m.array
-            h, w = img.shape[0], img.shape[1]
-
             # Green is (0,255,0) in both RGB and BGR.
             color = np.array([0, 255, 0], dtype=img.dtype)
 
-            for b in boxes:
-                if not isinstance(b, (list, tuple)) or len(b) != 4:
-                    continue
-                a, c, d, e = b
-                try:
-                    a = float(a); c = float(c); d = float(d); e = float(e)
-                except Exception:
-                    continue
-
-                # Heuristic: if all are in 0..1 range, treat as normalized.
-                normalized = 0.0 <= a <= 1.0 and 0.0 <= c <= 1.0 and 0.0 <= d <= 1.0 and 0.0 <= e <= 1.0
-
-                # Interpret either (x1,y1,x2,y2) or (x,y,w,h)
-                # If values look like widths/heights (smallish), treat as x,y,w,h.
-                if normalized:
-                    # normalized x/y/w/h is common
-                    x = a * w
-                    y = c * h
-                    ww = d * w
-                    hh = e * h
-                    x1, y1, x2, y2 = x, y, x + ww, y + hh
-                else:
-                    # Decide based on whether (d,e) look like max coords or sizes
-                    if d > a and e > c and (d <= w + 1) and (e <= h + 1):
-                        # likely x1,y1,x2,y2 (already pixels)
-                        x1, y1, x2, y2 = a, c, d, e
-                    else:
-                        # treat as x,y,w,h (pixels)
-                        x1, y1, x2, y2 = a, c, a + d, c + e
-
-                self._draw_rect(img, x1, y1, x2, y2, color=color, thickness=2)
+            for det in detections:
+                x, y, w, h, *_ = det
+                # IMX500 helper returns x,y,w,h already in ISP output pixels.
+                self._draw_rect(img, x, y, x + w, y + h, color=color, thickness=2)
     
     def _setup_camera(self, max_retries=5, retry_delay=5):
         """Configure PiCamera2 with retry logic and intelligent format selection."""
@@ -376,7 +406,32 @@ class CameraRecorder:
                 self._full_camera_reset()
                 gc.collect()
                 
-                self.camera = Picamera2()
+                # If IMX500 overlay is enabled, instantiate the IMX500 device helper so we can
+                # decode inference tensors from metadata. Otherwise, boxes generally won't exist.
+                self._imx500 = None
+                self._imx500_intrinsics = None
+                self._imx500_last_results = []
+                if self.imx500_overlay:
+                    try:
+                        from picamera2.devices import IMX500
+                        from picamera2.devices.imx500 import NetworkIntrinsics
+                        self._imx500 = IMX500(self.imx500_model)
+                        self._imx500_intrinsics = self._imx500.network_intrinsics or NetworkIntrinsics()
+                        if getattr(self._imx500_intrinsics, "task", "") != "object detection":
+                            self.logger.warning("[IMX500] Network task is not 'object detection'; overlay may not work")
+                        # Ensure defaults (labels, bbox normalization/order, etc.)
+                        try:
+                            self._imx500_intrinsics.update_with_defaults()
+                        except Exception:
+                            pass
+                        self.camera = Picamera2(self._imx500.camera_num)
+                    except Exception as e:
+                        self.logger.warning(f"[IMX500] Failed to initialize IMX500 helper, overlay disabled: {e}")
+                        self._imx500 = None
+                        self._imx500_intrinsics = None
+                        self.camera = Picamera2()
+                else:
+                    self.camera = Picamera2()
                 frame_duration_us = int(1_000_000 / self.fps)
                 
                 # Check if color format is forced in config
@@ -444,7 +499,7 @@ class CameraRecorder:
                 self.logger.info(f"Bitrate: {self.bitrate/1_000_000:.1f}Mbps")
                 self.logger.info(f"Color format: {'BGR888 (no conversion)' if getattr(self, 'use_bgr_format', False) else 'RGB888 (with conversion)'}")
                 if self.imx500_overlay:
-                    self.logger.info("[IMX500] Overlay enabled (will draw boxes when metadata is present)")
+                    self.logger.info(f"[IMX500] Overlay enabled (model={getattr(self, 'imx500_model', '')})")
                 time.sleep(2)
                 return True
             except Exception as e:
