@@ -323,11 +323,15 @@ class VideoRecorder:
         retry_interval_sec = self.cloud_uploader.pending_retry_interval_minutes * 60
 
         try:
+            main_yield = float(self.config.get("recording", "main_loop_yield_seconds", fallback="0") or "0")
+        except ValueError:
+            main_yield = 0.0
+        main_yield = max(0.0, min(main_yield, 10.0))
             while True:
                 try:
-                    # Check camera before recording
-                    if self.camera_recorder.camera is None:
-                        self.logger.warning("Camera not initialized, attempting setup...")
+                    # Check camera (or rpicam-vid binary) before recording
+                    if not self.camera_recorder.is_ready_to_record():
+                        self.logger.warning("Recorder not ready, attempting camera/setup...")
                         if not self.camera_recorder._reinit_camera():
                             self.logger.error(f"Camera setup failed. Waiting {error_backoff} seconds before retry...")
                             time.sleep(error_backoff)
@@ -350,6 +354,8 @@ class VideoRecorder:
 
                     if success:
                         consecutive_errors = 0  # Reset error counter on success
+                        if main_yield > 0:
+                            time.sleep(main_yield)
                     else:
                         consecutive_errors += 1
                         self.logger.warning(f"Recording failed. Consecutive errors: {consecutive_errors}")

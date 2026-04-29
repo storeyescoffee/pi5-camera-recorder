@@ -45,7 +45,8 @@ def _run_test(config_file="config.conf"):
             bucket = loc.split("/", 1)[0] if loc else None
             if bucket:
                 import boto3
-                from botocore.client import Config
+                from botocore.config import Config
+                cfg_probe = Config(signature_version="s3v4", max_pool_connections=16)
                 # Prefer credentials from config [aws] (store settings), else boto3 default chain.
                 access_key = config.get("aws", "access_key", fallback="").strip() if config.has_section("aws") else ""
                 secret_key = config.get("aws", "secret_key", fallback="").strip() if config.has_section("aws") else ""
@@ -58,11 +59,27 @@ def _run_test(config_file="config.conf"):
                         creds["aws_session_token"] = session_token
                 base_region = default_region or "us-east-1"
 
-                client = boto3.client("s3", region_name=base_region, config=Config(signature_version="s3v4"), **creds)
-                region_resp = client.get_bucket_location(Bucket=bucket)
+                client = boto3.Session(**creds).client("s3", region_name=base_region, config=cfg_probe)
+                try:
+                    region_resp = client.get_bucket_location(Bucket=bucket)
+                finally:
+                    try:
+                        client.close()
+                    except Exception:
+                        pass
                 region = region_resp.get("LocationConstraint") or "us-east-1"
-                regional = boto3.client("s3", region_name=region, config=Config(signature_version="s3v4"), **creds)
-                regional.head_bucket(Bucket=bucket)
+                regional = boto3.Session(**creds).client(
+                    "s3",
+                    region_name=region,
+                    config=cfg_probe,
+                )
+                try:
+                    regional.head_bucket(Bucket=bucket)
+                finally:
+                    try:
+                        regional.close()
+                    except Exception:
+                        pass
                 s3_ok = True
                 print(f"S3:   OK (bucket={bucket}, region={region})")
             else:

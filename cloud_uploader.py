@@ -6,12 +6,14 @@ Handles all S3/GCS upload functionality with retry logic and concurrent uploads.
 
 import csv
 import os
+import random
 import time
 import threading
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import boto3
-from botocore.client import Config
+from botocore.config import Config
 
 from api_client import create_api_client
 
@@ -29,16 +31,23 @@ class CloudUploader:
         """
         self.config = config
         self.logger = logger or self._setup_logging()
-        
-        self.upload_threads = []
+
         self.active_uploads = 0
         self.upload_lock = threading.Lock()
         self.csv_lock = threading.Lock()
+        self._reinit_lock = threading.Lock()  # serialize S3 close/reinit across upload worker threads
         self.s3_client = None
         self.s3_region = None
+        self._boto_session = None  # boto3.Session — one session, one pooled S3 client
+        self._upload_executor = None  # bounded thread pool for uploads (never one OS thread per clip)
+        self._upload_executor_workers = None
+        self._upload_slot_n = None
+        self._upload_busy = None  # threading.Semaphore(max_concurrent) — backpressure on queue
         self.api_client = create_api_client(config, logger)
-        
+
         self._load_config()
+        self._ensure_upload_limits()
+        self._ensure_upload_executor_locked()
         self._init_s3_client()
     
     def _get_aws_credentials_kwargs(self):
@@ -93,6 +102,15 @@ class CloudUploader:
             self.bitrate = int(self.config.get("camera", "bitrate"))
             self.pending_uploads_csv = self.config.get("recording", "pending_uploads_csv", fallback="./pending_uploads.csv")
             self.pending_retry_interval_minutes = int(self.config.get("recording", "pending_retry_interval_minutes", fallback="10"))
+            # urllib3 pool used by boto3 (avoid CLOSE-WAIT / pool exhaustion when max_concurrent_uploads > default 10)
+            _mc = max(1, self.max_concurrent_uploads)
+            _default_pool = str(max(_mc * 4, 32))
+            self.s3_pool_connections = int(self.config.get("recording", "s3_pool_connections", fallback=_default_pool))
+            # App-level upload retries (distinct from botocore's internal retries on single request)
+            self.upload_retry_backoff_initial = float(
+                self.config.get("recording", "upload_retry_backoff_initial_sec", fallback="2")
+            )
+            self.upload_retry_backoff_cap = float(self.config.get("recording", "upload_retry_backoff_cap_sec", fallback="120"))
             
             self.video_url_base = self.config.get("api", "video_url_base", fallback="").strip() if self.config.has_section("api") else ""
             
@@ -106,62 +124,130 @@ class CloudUploader:
             self.logger.error(f"Error loading cloud upload configuration: {e}", exc_info=True)
             raise
 
+    def _make_botocore_config(self):
+        """Shared botocore Config: urllib3 pool size, timeouts, retries (reduces CLOSE-WAIT / stalls)."""
+        pool = max(self.s3_pool_connections, self.max_concurrent_uploads * 4, 32)
+        retries = {"max_attempts": 10, "mode": "standard"}
+        kw = dict(
+            signature_version="s3v4",
+            max_pool_connections=pool,
+            retries=retries,
+            connect_timeout=60,
+            read_timeout=300,
+        )
+        try:
+            return Config(**kw, tcp_keepalive=True)
+        except TypeError:
+            return Config(**kw)
+
+    def _close_s3_connection(self):
+        """Release urllib3 pools and CLOSE-WAIT sockets before creating a new client."""
+        client = getattr(self, "s3_client", None)
+        if client is not None:
+            try:
+                client.close()
+            except Exception:
+                pass
+        self.s3_client = None
+        self._boto_session = None
+
+    def _ensure_upload_executor_locked(self):
+        """Rebuild ThreadPoolExecutor when max_concurrent_uploads changes (under caller coordination)."""
+        n = max(1, int(self.max_concurrent_uploads))
+        if self._upload_executor_workers == n and self._upload_executor is not None:
+            return
+        if self._upload_executor is not None:
+            self._upload_executor.shutdown(wait=True, cancel_futures=False)
+            self._upload_executor = None
+        self._upload_executor_workers = n
+        self._upload_executor = ThreadPoolExecutor(
+            max_workers=n,
+            thread_name_prefix="s3-upload",
+        )
+        self.logger.info(f"[UPLOAD] Thread pool ready: max_workers={n}")
+
+    def _ensure_upload_limits(self):
+        """Recreate semaphore when max_concurrent_uploads changes (blocks producers like the old busy-wait loop)."""
+        n = max(1, int(self.max_concurrent_uploads))
+        if getattr(self, "_upload_slot_n", None) == n and self._upload_busy is not None:
+            return
+        self._upload_slot_n = n
+        self._upload_busy = threading.Semaphore(n)
+
     def reload_settings(self):
         """Reload configuration from config (e.g. after sync-settings MQTT message)."""
         self._load_config()
+        with self.upload_lock:
+            self._ensure_upload_limits()
+            self._ensure_upload_executor_locked()
+            self._close_s3_connection()
+        self._init_s3_client()
         self.logger.info("[STORE] Cloud upload settings reloaded")
     
     def _init_s3_client(self, max_retries=5, retry_delay=10):
-        """Create S3 client with automatic region detection and retry logic.
-        
-        Uses AWS credentials from config [aws] if present, otherwise AWS default credential chain
-        (environment variables, IAM roles, ~/.aws/credentials).
-        """
+        """Create one boto3 Session + one regional S3 client; close discovery client to avoid leaking sockets."""
+        self._close_s3_connection()
+        cfg = self._make_botocore_config()
+        creds = self._get_aws_credentials_kwargs()
+        base_region = self._get_aws_default_region() or "us-east-1"
+
         for attempt in range(1, max_retries + 1):
             try:
-                creds = self._get_aws_credentials_kwargs()
-                base_region = self._get_aws_default_region() or "us-east-1"
-                base_client = boto3.client(
-                    "s3",
-                    region_name=base_region,
-                    config=Config(signature_version="s3v4"),
-                    **creds,
-                )
-                
-                region_resp = base_client.get_bucket_location(Bucket=self.bucket_name)
+                self._boto_session = boto3.Session(**creds)
+
+                base_client = self._boto_session.client("s3", region_name=base_region, config=cfg)
+                try:
+                    region_resp = base_client.get_bucket_location(Bucket=self.bucket_name)
+                finally:
+                    try:
+                        base_client.close()
+                    except Exception:
+                        pass
+
                 actual_region = region_resp.get("LocationConstraint") or "us-east-1"
                 self.logger.info(f"Detected S3 bucket region: {actual_region}")
-                
+
                 endpoint = f"https://s3.{actual_region}.amazonaws.com"
                 self.logger.info(f"Using regional S3 endpoint: {endpoint}")
-                
-                self.s3_client = boto3.client(
+
+                self.s3_client = self._boto_session.client(
                     "s3",
                     endpoint_url=endpoint,
                     region_name=actual_region,
-                    config=Config(signature_version="s3v4"),
-                    **creds,
+                    config=cfg,
                 )
                 self.s3_region = actual_region
-                
-                self.logger.info("✅ S3 client initialized successfully.")
+
+                self.logger.info("✅ S3 client initialized successfully (singleton per process, pooled connections).")
                 return True
             except Exception as e:
                 self.logger.error(f"Error initializing S3 client (attempt {attempt}/{max_retries}): {e}")
+                self._close_s3_connection()
                 if attempt < max_retries:
                     self.logger.info(f"Retrying S3 initialization in {retry_delay} seconds...")
                     time.sleep(retry_delay)
                 else:
                     self.logger.error("Failed to initialize S3 client after all retries. Uploads will be disabled.")
-                    self.logger.error("Make sure AWS credentials are configured (environment variables, IAM role, or ~/.aws/credentials)")
+                    self.logger.error(
+                        "Make sure AWS credentials are configured (environment variables, IAM role, or ~/.aws/credentials)"
+                    )
                     self.s3_client = None
                     return False
-    
+
     def _reinit_s3_client(self):
-        """Reinitialize S3 client if it failed previously."""
-        if self.s3_client is None:
-            self.logger.info("Attempting to reinitialize S3 client...")
-            self._init_s3_client(max_retries=3, retry_delay=5)
+        """Reinitialize S3 client (serialized — avoids concurrent close/init from multiple upload threads)."""
+        acquired = self._reinit_lock.acquire(blocking=False)
+        if not acquired:
+            self.logger.info("[UPLOAD] S3 reinit already in progress, waiting...")
+            with self._reinit_lock:
+                pass
+            return
+        try:
+            self._close_s3_connection()
+            self.logger.info("[UPLOAD] Reinitializing S3 client...")
+            self._init_s3_client(max_retries=3, retry_delay=min(60, float(self.upload_retry_backoff_cap)))
+        finally:
+            self._reinit_lock.release()
     
     PENDING_CSV_HEADER = ["local_path", "s3_key", "filename", "failed_at", "video_code"]
 
@@ -229,16 +315,17 @@ class CloudUploader:
         region = self.s3_region or self.region
         return f"https://{self.bucket_name}.s3.{region}.amazonaws.com/{key}"
 
-    def _cleanup_finished_threads(self):
-        """Clean up finished upload threads."""
-        with self.upload_lock:
-            finished_threads = [t for t in self.upload_threads if not t.is_alive()]
-            self.upload_threads = [t for t in self.upload_threads if t.is_alive()]
-            
-            if finished_threads:
-                self.logger.debug(f"[CLEANUP] Removed {len(finished_threads)} finished upload threads")
-    
-    def _upload_worker(self, local_path, s3_key, filename, max_retries=3, is_fallback=False, existing_video_code=None, start_time=None):
+    def _retry_delays_seconds(self, attempt_index_1_based):
+        """Exponential backoff with jitter between app-level retries (attempt 1→2, etc.)."""
+        cap = float(self.upload_retry_backoff_cap)
+        base = float(self.upload_retry_backoff_initial)
+        exp = min(cap, base * (2 ** max(0, attempt_index_1_based - 1)))
+        jitter_max = min(30.0, exp * 0.25 + 1.0)
+        return exp + random.uniform(0, jitter_max)
+
+    def _upload_job_impl(
+        self, local_path, s3_key, filename, max_retries=3, is_fallback=False, existing_video_code=None, start_time=None
+    ):
         """Upload file to S3 with retry logic, metadata, and detailed statistics.
 
         is_fallback: True when retrying from pending CSV.
@@ -248,17 +335,15 @@ class CloudUploader:
         if self.s3_client is None:
             self.logger.error(f"[UPLOAD] S3 client unavailable, cannot upload {s3_key}")
             self._add_pending_upload(local_path, s3_key, filename, video_code=existing_video_code)
-            with self.upload_lock:
-                self.active_uploads -= 1
             return
 
         if not os.path.exists(local_path):
             self.logger.error(f"[UPLOAD] File not found: {local_path}")
             self._remove_pending_upload(local_path)
-            with self.upload_lock:
-                self.active_uploads -= 1
             return
 
+        t0 = time.time()
+        size_mb = 0.0
         try:
             file_size = os.path.getsize(local_path)
             duration_seconds = self.recording_duration * 60
@@ -335,12 +420,13 @@ class CloudUploader:
                 except Exception as e:
                     self.logger.error(f"[UPLOAD] Failed for {s3_key} (attempt {attempt}/{max_retries}): {e}", exc_info=True)
                     if attempt < max_retries:
-                        # Try to reinitialize S3 client before retry
-                        if self.s3_client is None:
-                            self._reinit_s3_client()
-                        wait_time = 5 * attempt  # Exponential backoff
-                        self.logger.info(f"[UPLOAD] Retrying in {wait_time} seconds...")
+                        self._close_s3_connection()
+                        self._reinit_s3_client()
+                        wait_time = self._retry_delays_seconds(attempt)
+                        self.logger.info(f"[UPLOAD] Retrying upload in {wait_time:.1f} seconds...")
                         time.sleep(wait_time)
+                        if self.s3_client is None:
+                            continue
                     else:
                         self.logger.error(f"[UPLOAD] Failed after {max_retries} attempts. File: {local_path}")
                         self._add_pending_upload(local_path, s3_key, filename, video_code=video_code)
@@ -348,50 +434,53 @@ class CloudUploader:
                             dt = time.time() - t0
                             upload_speed_mbps = (size_mb * 8) / dt if dt > 0 else 0
                             self.api_client.put_main_video(video_code, int(dt), upload_speed_mbps, max_retries, "FAILED")
-        finally:
-            with self.upload_lock:
-                self.active_uploads -= 1
-                self.logger.info(f"[UPLOAD] Upload thread finished for {filename}")
-    
-    def upload_file(self, local_path, s3_key, filename, is_fallback=False, video_code=None, start_time=None):
-        """
-        Queue a file for upload.
 
-        Args:
-            local_path: Path to local file
-            s3_key: S3 key/path for the file
-            filename: Filename for logging
-            is_fallback: True when retrying from pending CSV
-            video_code: From CSV when POST succeeded but upload failed (scenario 1)
-            start_time: Recording start time (datetime); if None, derived from file mtime - duration
-        """
+        except Exception as e:
+            self.logger.error(f"[UPLOAD] Unexpected error during upload pipeline for {filename}: {e}", exc_info=True)
+            raise
+
+    def upload_file(self, local_path, s3_key, filename, is_fallback=False, video_code=None, start_time=None):
+        """Queue one upload: bounded ThreadPoolExecutor plus semaphore (capacity = max concurrent)."""
+        self._ensure_upload_limits()
+        self._ensure_upload_executor_locked()
         if self.s3_client is None:
             self.logger.warning(f"[UPLOAD] S3 client unavailable, skipping upload for {filename}")
             self._reinit_s3_client()
+        if self.s3_client is None:
+            self.logger.error(f"[UPLOAD] Cannot queue upload (no S3 client): {filename}")
             return
 
-        # Wait if we've reached max concurrent uploads
-        while self.active_uploads >= self.max_concurrent_uploads:
-            self.logger.info(f"[UPLOAD] Max concurrent uploads ({self.max_concurrent_uploads}) reached, waiting...")
-            time.sleep(2)
-            self._cleanup_finished_threads()
-
-        # Create and start upload thread
-        upload_thread = threading.Thread(
-            target=self._upload_worker,
-            args=(local_path, s3_key, filename),
-            kwargs={"is_fallback": is_fallback, "existing_video_code": video_code or None, "start_time": start_time},
-            daemon=True,
-            name=f"Upload-{filename}"
-        )
-        
-        # Add to thread list and increment counter atomically
+        self._upload_busy.acquire()
         with self.upload_lock:
-            self.upload_threads.append(upload_thread)
             self.active_uploads += 1
-        
-        upload_thread.start()
-        self.logger.info(f"[UPLOAD] Upload thread started for {filename} (Active uploads: {self.active_uploads})")
+
+        def run():
+            try:
+                self._upload_job_impl(
+                    local_path,
+                    s3_key,
+                    filename,
+                    is_fallback=is_fallback,
+                    existing_video_code=video_code or None,
+                    start_time=start_time,
+                )
+            finally:
+                with self.upload_lock:
+                    self.active_uploads -= 1
+                self._upload_busy.release()
+                self.logger.info(f"[UPLOAD] Upload task finished for {filename}")
+
+        try:
+            self._upload_executor.submit(run)
+        except Exception as e:
+            with self.upload_lock:
+                self.active_uploads -= 1
+            self._upload_busy.release()
+            self.logger.error(f"[UPLOAD] Failed to queue upload for {filename}: {e}", exc_info=True)
+            raise
+        with self.upload_lock:
+            n = self.active_uploads
+        self.logger.info(f"[UPLOAD] Upload queued for {filename} (tracked active: {n})")
     
     def retry_pending_uploads(self):
         """Retry all uploads listed in pending_uploads.csv. Removes entries for missing files.
@@ -412,7 +501,6 @@ class CloudUploader:
             return 0
         self.logger.info(f"[PENDING] Retrying {len(rows)} pending upload(s)...")
         count = 0
-        remaining = []
         for row in rows:
             local_path = row.get("local_path", "")
             s3_key = row.get("s3_key", "")
@@ -470,18 +558,21 @@ class CloudUploader:
             if timeout and (time.time() - start_time) > timeout:
                 self.logger.warning(f"[UPLOAD] Timeout waiting for uploads after {timeout} seconds")
                 break
-            time.sleep(1)
-            self._cleanup_finished_threads()
+            time.sleep(0.5)
         self.logger.info("[UPLOAD] All uploads completed")
-    
+
     def cleanup(self):
-        """Cleanup resources and wait for uploads to finish."""
+        """Shutdown upload pool and close S3 client (urllib3 pools / sockets)."""
         try:
-            if self.upload_threads:
-                self.logger.info(f"[CLEANUP] Waiting for {len(self.upload_threads)} upload threads to complete...")
-                for thread in self.upload_threads:
-                    if thread.is_alive():
-                        thread.join(timeout=30)  # Wait max 30 seconds per thread
+            ex = getattr(self, "_upload_executor", None)
+            if ex is not None:
+                self.logger.info("[CLEANUP] Shutting down upload executor...")
+                ex.shutdown(wait=True, cancel_futures=False)
+                self._upload_executor = None
         except Exception as e:
-            self.logger.error(f"[CLEANUP] Error during upload cleanup: {e}", exc_info=True)
+            self.logger.error(f"[CLEANUP] Error shutting down upload executor: {e}", exc_info=True)
+        try:
+            self._close_s3_connection()
+        except Exception as e:
+            self.logger.error(f"[CLEANUP] Error closing S3 client: {e}", exc_info=True)
 

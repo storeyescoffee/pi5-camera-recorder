@@ -7,6 +7,8 @@ Handles all camera setup, video recording, and file management.
 import csv
 import gc
 import os
+import shutil
+import shlex
 import signal
 import subprocess
 import time
@@ -19,6 +21,7 @@ import prctl
 from picamera2 import Picamera2, MappedArray
 from picamera2.encoders import H264Encoder
 from picamera2.outputs import FfmpegOutput
+from picamera2.platform import Platform, get_platform
 import libcamera
 
 
@@ -89,6 +92,9 @@ class CameraRecorder:
         self._pending_camera_reinit = False  # Set by reload_settings(); reinit before next recording
 
         self._load_config()
+        if self.use_rpicam_vid and self.imx500_overlay:
+            self.logger.warning("[CONFIG] use_rpicam_vid disabled: not compatible with IMX500 overlay")
+            self.use_rpicam_vid = False
         Path(self.local_storage_path).mkdir(parents=True, exist_ok=True)
         
         # Clean up old recordings on startup
@@ -131,6 +137,11 @@ class CameraRecorder:
             self.post_stop_delay_seconds = float(self.config.get("recording", "post_stop_delay_seconds", fallback="1.5"))
             self.periodic_camera_reinit_recordings = int(self.config.get("recording", "periodic_camera_reinit_recordings", fallback="0"))
             self.ffmpeg_video_thread_queue_size = int(self.config.get("recording", "ffmpeg_video_thread_queue_size", fallback="512"))
+            # Optional: use official rpicam-vid instead of PiCamera2 (frees Python from holding the camera; good on Pi 5)
+            self.use_rpicam_vid = self.config.getboolean("recording", "use_rpicam_vid", fallback=False)
+            self.rpicam_vid_path = (self.config.get("recording", "rpicam_vid_path", fallback="") or "rpicam-vid").strip()
+            self.rpicam_codec = (self.config.get("recording", "rpicam_codec", fallback="h264") or "h264").strip()
+            self.rpicam_extra_args = self.config.get("recording", "rpicam_extra_args", fallback="").strip()
             
             # bucket_location from RECORDING.s3-location (API/cache only)
             self.bucket_location = self.config.get("gcs", "bucket_location").strip()
@@ -139,6 +150,51 @@ class CameraRecorder:
         except Exception as e:
             self.logger.error(f"Error loading camera configuration: {e}", exc_info=True)
             raise
+
+    def is_ready_to_record(self):
+        """True when recording can start: PiCamera2 open, or rpicam-vid mode (binary ok)."""
+        if getattr(self, "use_rpicam_vid", False):
+            return self._resolve_rpicam_executable() is not None
+        return self.camera is not None
+
+    def _resolve_rpicam_executable(self):
+        """Return full path to rpicam-vid, or None if not found."""
+        p = self.rpicam_vid_path
+        if os.path.isabs(p) and os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
+        w = shutil.which(p)
+        if w and os.path.isfile(w):
+            return w
+        if os.path.isabs(p):
+            return p if os.path.isfile(p) and os.access(p, os.X_OK) else None
+        return None
+
+    def _build_rpicam_cmd(self, local_path, duration_seconds):
+        """Assemble rpicam-vid argv. Bitrate in bits per second (see Raspberry Pi docs)."""
+        exe = self._resolve_rpicam_executable()
+        if not exe:
+            raise RuntimeError("rpicam-vid not on PATH; set rpicam_vid_path in [recording]")
+
+        cmd = [
+            exe, "-n",
+            "-o", local_path,
+            "-t", f"{int(duration_seconds)}s",
+            "--width", str(self.resolution_width),
+            "--height", str(self.resolution_height),
+            "--framerate", str(self.fps),
+            "-b", str(self.bitrate),
+            "-g", str(self.fps),
+            "--shutter", str(self.shutter_speed),
+            "--gain", str(self.analog_gain),
+            "--inline",
+        ]
+        if self.rpicam_codec and self.rpicam_codec != "h264":
+            cmd.extend(["--codec", self.rpicam_codec])
+        if self.reverse_camera:
+            cmd.extend(["--hflip", "--vflip"])
+        if self.rpicam_extra_args:
+            cmd.extend(shlex.split(self.rpicam_extra_args))
+        return cmd
 
     def reload_settings(self, force_camera_reinit=True):
         """Reload configuration from config (e.g. after sync-settings MQTT message).
@@ -399,7 +455,26 @@ class CameraRecorder:
                 self._draw_rect(img, x, y, x + w, y + h, color=color, thickness=2)
     
     def _setup_camera(self, max_retries=5, retry_delay=5):
-        """Configure PiCamera2 with retry logic and intelligent format selection."""
+        """Configure PiCamera2 with retry logic; or rpicam-vid-only mode (no Python camera)."""
+        if self.use_rpicam_vid:
+            self._full_camera_reset()
+            gc.collect()
+            ex = self._resolve_rpicam_executable()
+            if not ex:
+                self.logger.error(
+                    "[RECORD] rpicam-vid not found (apt install rpicam-apps) or set recording.rpicam_vid_path"
+                )
+                return False
+            self._color_format_log = f"rpicam-vid -> {ex}"
+            self.logger.info(
+                f"[RECORD] rpicam-vid mode: PiCamera2 not used; segments recorded by: {ex}"
+            )
+            self.logger.info(
+                f"Target capture {self.resolution_width}x{self.resolution_height}@{self.fps}fps, "
+                f"bitrate {self.bitrate/1_000_000:.1f} Mbps"
+            )
+            return True
+
         for attempt in range(1, max_retries + 1):
             try:
                 # Clean up previous camera instance; use full reset for thorough release
@@ -449,42 +524,72 @@ class CameraRecorder:
                         )
                         self.camera.configure(video_config)
                         self.use_bgr_format = (self.force_color_format == "BGR888")
+                        self._color_format_log = f"{self.force_color_format} (forced in config)"
                         self.logger.info(f"Camera configured with forced format: {self.force_color_format}")
                     except Exception as forced_error:
                         self.logger.error(f"Failed to configure camera with forced format {self.force_color_format}: {forced_error}")
                         raise
                 else:
-                    # Try BGR888 format first for optimal performance
-                    try:
-                        video_config = self.camera.create_video_configuration(
-                            main={"size": (self.resolution_width, self.resolution_height), "format": "BGR888"},
-                            controls={
-                                "ExposureTime": self.shutter_speed,
-                                "AnalogueGain": self.analog_gain,
-                                "FrameDurationLimits": (frame_duration_us, frame_duration_us),
-                                "AeEnable": True,
-                                "AeFlickerPeriod": 10000
-                            },
-                            transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform()
-                        )
-                        self.camera.configure(video_config)
-                        self.use_bgr_format = True
-                        self.logger.info("Using BGR888 format - no color conversion needed")
-                    except Exception as bgr_error:
-                        # Fallback to RGB888 if BGR888 is not supported
-                        self.logger.warning(f"BGR888 format not supported, falling back to RGB888: {bgr_error}")
-                        video_config = self.camera.create_video_configuration(
-                            main={"size": (self.resolution_width, self.resolution_height), "format": "RGB888"},
-                            controls={
-                                "ExposureTime": self.shutter_speed,
-                                "AnalogueGain": self.analog_gain,
-                                "FrameDurationLimits": (frame_duration_us, frame_duration_us),
-                            },
-                            transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform()
-                        )
-                        self.camera.configure(video_config)
-                        self.use_bgr_format = False
-                        self.logger.info("Using RGB888 format - color conversion will be applied")
+                    # Pi 4 (VC4): H.264 is V4L2 hardware; BGR is a good default.
+                    # Pi 5 (PISP): H264Encoder is Libav/libx264 (no HW encode). YUV420 main avoids
+                    # a heavy RGB→YUV path in the encoder. IMX500 overlay needs RGB-style buffers; keep BGR.
+                    yuv_tried = False
+                    if get_platform() != Platform.VC4 and not self.imx500_overlay:
+                        try:
+                            video_config = self.camera.create_video_configuration(
+                                main={"size": (self.resolution_width, self.resolution_height), "format": "YUV420"},
+                                controls={
+                                    "ExposureTime": self.shutter_speed,
+                                    "AnalogueGain": self.analog_gain,
+                                    "FrameDurationLimits": (frame_duration_us, frame_duration_us),
+                                    "AeEnable": True,
+                                    "AeFlickerPeriod": 10000
+                                },
+                                transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform()
+                            )
+                            self.camera.configure(video_config)
+                            self.use_bgr_format = False
+                            self._color_format_log = "YUV420 (Libav H.264; best CPU on Pi 5)"
+                            yuv_tried = True
+                            self.logger.info("Using YUV420 for software H.264 (reduces load vs BGR on Pi 5+)")
+                        except Exception as yuv_e:
+                            self.logger.warning(f"YUV420 main not available, trying BGR888: {yuv_e}")
+
+                    if not yuv_tried:
+                        # BGR888 first on Pi 4 (hw encode), or fallback on Pi 5
+                        try:
+                            video_config = self.camera.create_video_configuration(
+                                main={"size": (self.resolution_width, self.resolution_height), "format": "BGR888"},
+                                controls={
+                                    "ExposureTime": self.shutter_speed,
+                                    "AnalogueGain": self.analog_gain,
+                                    "FrameDurationLimits": (frame_duration_us, frame_duration_us),
+                                    "AeEnable": True,
+                                    "AeFlickerPeriod": 10000
+                                },
+                                transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform()
+                            )
+                            self.camera.configure(video_config)
+                            self.use_bgr_format = True
+                            bgr_msg = "BGR888 — V4L2 H.264 has no BGR->YUV in userspace" if get_platform() == Platform.VC4 else "BGR888 — Libav H.264 converts to YUV (higher CPU on Pi 5)"
+                            self._color_format_log = bgr_msg
+                            self.logger.info("Using BGR888 format" + (" - preferred for hardware encoder (Pi 4)" if get_platform() == Platform.VC4 else ""))
+                        except Exception as bgr_error:
+                            # Fallback to RGB888 if BGR888 is not supported
+                            self.logger.warning(f"BGR888 format not supported, falling back to RGB888: {bgr_error}")
+                            video_config = self.camera.create_video_configuration(
+                                main={"size": (self.resolution_width, self.resolution_height), "format": "RGB888"},
+                                controls={
+                                    "ExposureTime": self.shutter_speed,
+                                    "AnalogueGain": self.analog_gain,
+                                    "FrameDurationLimits": (frame_duration_us, frame_duration_us),
+                                },
+                                transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform()
+                            )
+                            self.camera.configure(video_config)
+                            self.use_bgr_format = False
+                            self._color_format_log = "RGB888 (with conversion in encoder)"
+                            self.logger.info("Using RGB888 format - color conversion will be applied")
                 
                 # Optional per-frame overlay (runs before encoding).
                 self.camera.post_callback = self.imx500_overlay_callback if self.imx500_overlay else None
@@ -497,7 +602,7 @@ class CameraRecorder:
                 self.logger.info(f"Frame duration: {frame_duration_us}μs (target: {1_000_000/self.fps:.1f}μs)")
                 self.logger.info(f"Analog gain: {self.analog_gain}, Shutter speed: {self.shutter_speed}μs")
                 self.logger.info(f"Bitrate: {self.bitrate/1_000_000:.1f}Mbps")
-                self.logger.info(f"Color format: {'BGR888 (no conversion)' if getattr(self, 'use_bgr_format', False) else 'RGB888 (with conversion)'}")
+                self.logger.info(f"Color format: {getattr(self, '_color_format_log', 'see above')}")
                 if self.imx500_overlay:
                     self.logger.info(f"[IMX500] Overlay enabled (model={getattr(self, 'imx500_model', '')})")
                 time.sleep(2)
@@ -692,22 +797,27 @@ class CameraRecorder:
         Returns:
             tuple: (success: bool, local_path: str, s3_key: str, filename: str) or (False, None, None, None)
         """
-        if self.camera is None:
-            self.logger.error("[RECORD] Camera not available, attempting to reinitialize...")
-            if not self._reinit_camera():
-                self.logger.error("[RECORD] Cannot record: camera unavailable")
-                return False, None, None, None
+        if not self.use_rpicam_vid:
+            if self.camera is None:
+                self.logger.error("[RECORD] Camera not available, attempting to reinitialize...")
+                if not self._reinit_camera():
+                    self.logger.error("[RECORD] Cannot record: camera unavailable")
+                    return False, None, None, None
 
         # Reinit camera if settings were synced (shutter, gain, flip need hardware reconfig)
         if self._pending_camera_reinit:
-            self.logger.info("[RECORD] Settings synced, reinitializing camera for new hardware config...")
-            self._full_camera_reset()
-            if not self._setup_camera(max_retries=3, retry_delay=5):
-                return False, None, None, None
-            self._pending_camera_reinit = False
+            if self.use_rpicam_vid:
+                self._pending_camera_reinit = False
+                self.logger.info("[RECORD] Settings synced; rpicam-vid will use updated config on this segment")
+            else:
+                self.logger.info("[RECORD] Settings synced, reinitializing camera for new hardware config...")
+                self._full_camera_reset()
+                if not self._setup_camera(max_retries=3, retry_delay=5):
+                    return False, None, None, None
+                self._pending_camera_reinit = False
 
         reinit_interval = getattr(self, "periodic_camera_reinit_recordings", 0)
-        if reinit_interval > 0 and self._recording_count > 0 and self._recording_count % reinit_interval == 0:
+        if (not self.use_rpicam_vid) and reinit_interval > 0 and self._recording_count > 0 and self._recording_count % reinit_interval == 0:
             self.logger.info(f"[RECORD] Periodic camera reinit (every {reinit_interval} recordings)")
             self._full_camera_reset()
             if not self._setup_camera(max_retries=3, retry_delay=5):
@@ -721,21 +831,73 @@ class CameraRecorder:
             s3_key = f"{key_prefix}/{filename}"
 
             self.logger.info(f"[RECORD] Starting recording: {filename}")
-            self.logger.info(f"[RECORD] Color format: {'BGR888 (no conversion)' if getattr(self, 'use_bgr_format', False) else 'RGB888 (with conversion)'}")
-            self.logger.info(f"[RECORD] Recording {self.recording_duration * 60}s at {self.fps}fps using native PiCamera2 recording...")
+            self.logger.info(f"[RECORD] Color format: {getattr(self, '_color_format_log', 'see startup log')}")
+            duration_seconds = self.recording_duration * 60
+            if self.use_rpicam_vid:
+                self.logger.info(
+                    f"[RECORD] Recording {duration_seconds}s at {self.fps}fps with rpicam-vid -> {filename}"
+                )
+                try:
+                    cmd = self._build_rpicam_cmd(local_path, duration_seconds)
+                except Exception as e:
+                    self.logger.error(f"[RECORD] {e}", exc_info=True)
+                    return False, None, None, None
+                self.logger.info(f"[RECORD] {' '.join(cmd)}")
+                t0 = time.time()
+                try:
+                    p = subprocess.run(cmd, capture_output=True, text=True, timeout=None)
+                except FileNotFoundError as e:
+                    self.logger.error(f"[RECORD] rpicam-vid: {e}")
+                    return False, None, None, None
+                if p.returncode != 0:
+                    self.logger.error(
+                        f"[RECORD] rpicam-vid exit {p.returncode}\n"
+                        f"stderr: {p.stderr or '(empty)'}\nstdout: {p.stdout or '(empty)'}"
+                    )
+                    return False, None, None, None
+                time.sleep(self.post_stop_delay_seconds)
+                self.logger.info(
+                    f"[RECORD] rpicam-vid done: target {duration_seconds}s, wall {time.time() - t0:.1f}s"
+                )
+                is_valid, message = self._verify_video_file(local_path)
+                if not is_valid:
+                    self.logger.error(f"[RECORD] Video file verification failed: {message}")
+                    return False, None, None, None
+                file_size_mb = os.path.getsize(local_path) / (1024 * 1024)
+                self.logger.info(
+                    f"[RECORD] Recording completed: {filename} ({file_size_mb:.1f} MB) - {message}"
+                )
+                self._recording_count += 1
+                if upload_callback and os.path.exists(local_path) and os.path.getsize(local_path) > 0:
+                    upload_callback(local_path, s3_key, filename, start_time=ts)
+                return True, local_path, s3_key, filename
 
-            enc = H264Encoder(bitrate=self.bitrate)
+            self.logger.info(
+                f"[RECORD] Recording {duration_seconds}s at {self.fps}fps using PiCamera2..."
+            )
+
+            # Libav H.264 on Pi 5 defaults framerate=30; must match self.fps for correct timing/bitrate.
+            enc = H264Encoder(
+                bitrate=self.bitrate,
+                framerate=self.fps,
+                iperiod=self.fps,
+                repeat=True,
+            )
             queue_size = getattr(self, "ffmpeg_video_thread_queue_size", 512)
             out = FfmpegOutputLargeQueue(local_path, video_thread_queue_size=queue_size)
 
             recording_start_time = time.time()
-            duration_seconds = self.recording_duration * 60
 
             # Safe start: never reuse a failed encoder
             started = self._safe_start_recording(enc, out, local_path)
             if not started:
                 self.logger.info("[RECORD] Retrying with fresh encoder after full camera reset...")
-                enc = H264Encoder(bitrate=self.bitrate)
+                enc = H264Encoder(
+                    bitrate=self.bitrate,
+                    framerate=self.fps,
+                    iperiod=self.fps,
+                    repeat=True,
+                )
                 out = FfmpegOutputLargeQueue(local_path, video_thread_queue_size=queue_size)
                 started = self._safe_start_recording(enc, out, local_path)
             if not started:
