@@ -185,7 +185,11 @@ class CloudUploader:
         self.logger.info("[STORE] Cloud upload settings reloaded")
     
     def _init_s3_client(self, max_retries=5, retry_delay=10):
-        """Create one boto3 Session + one regional S3 client; close discovery client to avoid leaking sockets."""
+        """Create regional S3 client: isolated boto3 Session for GetBucketLocation, then a fresh Session for uploads.
+
+        Reusing one Session for discovery + upload shared one urllib3 pool; closing only the discovery client
+        could leave CLOSE-WAIT on the Pi. Two sessions keep discovery connections fully discarded.
+        """
         self._close_s3_connection()
         cfg = self._make_botocore_config()
         creds = self._get_aws_credentials_kwargs()
@@ -193,23 +197,23 @@ class CloudUploader:
 
         for attempt in range(1, max_retries + 1):
             try:
-                self._boto_session = boto3.Session(**creds)
-
-                base_client = self._boto_session.client("s3", region_name=base_region, config=cfg)
+                discovery_session = boto3.Session(**creds)
+                discovery_client = discovery_session.client("s3", region_name=base_region, config=cfg)
                 try:
-                    region_resp = base_client.get_bucket_location(Bucket=self.bucket_name)
+                    region_resp = discovery_client.get_bucket_location(Bucket=self.bucket_name)
                 finally:
                     try:
-                        base_client.close()
+                        discovery_client.close()
                     except Exception:
                         pass
+                    discovery_client = None
+                    discovery_session = None
 
                 actual_region = region_resp.get("LocationConstraint") or "us-east-1"
-                self.logger.info(f"Detected S3 bucket region: {actual_region}")
-
                 endpoint = f"https://s3.{actual_region}.amazonaws.com"
-                self.logger.info(f"Using regional S3 endpoint: {endpoint}")
+                self.logger.info(f"Detected S3 bucket region: {actual_region}, endpoint: {endpoint}")
 
+                self._boto_session = boto3.Session(**creds)
                 self.s3_client = self._boto_session.client(
                     "s3",
                     endpoint_url=endpoint,
@@ -218,7 +222,7 @@ class CloudUploader:
                 )
                 self.s3_region = actual_region
 
-                self.logger.info("✅ S3 client initialized successfully (singleton per process, pooled connections).")
+                self.logger.info("✅ S3 client initialized (dedicated upload session, pooled connections).")
                 return True
             except Exception as e:
                 self.logger.error(f"Error initializing S3 client (attempt {attempt}/{max_retries}): {e}")
@@ -232,6 +236,7 @@ class CloudUploader:
                         "Make sure AWS credentials are configured (environment variables, IAM role, or ~/.aws/credentials)"
                     )
                     self.s3_client = None
+                    self._boto_session = None
                     return False
 
     def _reinit_s3_client(self):
