@@ -327,6 +327,8 @@ class VideoRecorder:
         except ValueError:
             main_yield = 0.0
         main_yield = max(0.0, min(main_yield, 10.0))
+
+        try:
             while True:
                 try:
                     # Check camera (or rpicam-vid binary) before recording
