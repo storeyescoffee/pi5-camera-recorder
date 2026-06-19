@@ -7,6 +7,7 @@ Handles all S3/GCS upload functionality with retry logic and concurrent uploads.
 import csv
 import os
 import random
+import subprocess
 import time
 import threading
 import logging
@@ -14,6 +15,13 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import boto3
 from botocore.config import Config
+from botocore.exceptions import (
+    ConnectionClosedError,
+    ConnectionError as BotoConnectionError,
+    ConnectTimeoutError,
+    EndpointConnectionError,
+    ReadTimeoutError,
+)
 
 from api_client import create_api_client
 
@@ -36,6 +44,9 @@ class CloudUploader:
         self.upload_lock = threading.Lock()
         self.csv_lock = threading.Lock()
         self._reinit_lock = threading.Lock()  # serialize S3 close/reinit across upload worker threads
+        self._bounce_lock = threading.Lock()  # serialize network rebounce + retry (one at a time)
+        self._network_bounce_needed = False  # set when an upload fails on a dead link
+        self._last_bounce_ts = 0.0  # monotonic-ish wall clock of last bounce (cooldown gate)
         self.s3_client = None
         self.s3_region = None
         self._boto_session = None  # boto3.Session — one session, one pooled S3 client
@@ -111,7 +122,19 @@ class CloudUploader:
                 self.config.get("recording", "upload_retry_backoff_initial_sec", fallback="2")
             )
             self.upload_retry_backoff_cap = float(self.config.get("recording", "upload_retry_backoff_cap_sec", fallback="120"))
-            
+
+            # Network rebounce: auto-bounce the NetworkManager link when uploads fail on a dead link.
+            self.network_rebounce_enabled = self.config.getboolean("recording", "network_rebounce_enabled", fallback=False)
+            self.network_rebounce_connection = self.config.get("recording", "network_rebounce_connection", fallback="main-pi").strip()
+            self.network_rebounce_cooldown = float(self.config.get("recording", "network_rebounce_cooldown_sec", fallback="120"))
+            self.network_rebounce_wait_after_up = float(self.config.get("recording", "network_rebounce_wait_after_up_sec", fallback="15"))
+            self.network_rebounce_down_up_gap = float(self.config.get("recording", "network_rebounce_down_up_gap_sec", fallback="2"))
+            self.network_rebounce_cmd_timeout = float(self.config.get("recording", "network_rebounce_cmd_timeout_sec", fallback="30"))
+            # S3 timeouts — low connect timeout detects a dead link fast; read stays high for large uploads.
+            self.s3_connect_timeout = int(self.config.get("recording", "s3_connect_timeout_sec", fallback="15"))
+            self.s3_read_timeout = int(self.config.get("recording", "s3_read_timeout_sec", fallback="300"))
+            self.s3_max_attempts = int(self.config.get("recording", "s3_max_attempts", fallback="3"))
+
             self.video_url_base = self.config.get("api", "video_url_base", fallback="").strip() if self.config.has_section("api") else ""
             
             self.logger.info("Cloud upload configuration loaded successfully.")
@@ -127,13 +150,13 @@ class CloudUploader:
     def _make_botocore_config(self):
         """Shared botocore Config: urllib3 pool size, timeouts, retries (reduces CLOSE-WAIT / stalls)."""
         pool = max(self.s3_pool_connections, self.max_concurrent_uploads * 4, 32)
-        retries = {"max_attempts": 10, "mode": "standard"}
+        retries = {"max_attempts": max(1, int(self.s3_max_attempts)), "mode": "standard"}
         kw = dict(
             signature_version="s3v4",
             max_pool_connections=pool,
             retries=retries,
-            connect_timeout=60,
-            read_timeout=300,
+            connect_timeout=int(self.s3_connect_timeout),
+            read_timeout=int(self.s3_read_timeout),
         )
         try:
             return Config(**kw, tcp_keepalive=True)
@@ -248,7 +271,92 @@ class CloudUploader:
             self._init_s3_client(max_retries=3, retry_delay=min(60, float(self.upload_retry_backoff_cap)))
         finally:
             self._reinit_lock.release()
-    
+
+    # Botocore errors that mean "the link is dead" (vs auth/4xx/5xx faults).
+    _CONNECTION_ERRORS = (
+        EndpointConnectionError,
+        ConnectTimeoutError,
+        ReadTimeoutError,
+        ConnectionClosedError,
+        BotoConnectionError,
+    )
+
+    def _is_connection_error(self, exc):
+        """True for network-down style errors a link rebounce can fix."""
+        if isinstance(exc, self._CONNECTION_ERRORS):
+            return True
+        # Fallback: some botocore/urllib3 wrappers don't subclass the above cleanly.
+        name = type(exc).__name__.lower()
+        return "timeout" in name or "connection" in name or "endpoint" in name
+
+    def _rebounce_network(self):
+        """Bounce the NetworkManager link: sudo nmcli connection down/up <conn>. Never raises."""
+        conn = self.network_rebounce_connection
+        timeout = self.network_rebounce_cmd_timeout
+
+        def _run(action):
+            cmd = ["sudo", "nmcli", "connection", action, conn]
+            self.logger.info(f"[NET] Running: {' '.join(cmd)}")
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+            except Exception as e:
+                self.logger.error(f"[NET] nmcli {action} {conn} failed to run: {e}")
+                return False
+            out = (r.stdout or "").strip()
+            err = (r.stderr or "").strip()
+            if out:
+                self.logger.info(f"[NET] nmcli {action} stdout: {out}")
+            if err:
+                self.logger.warning(f"[NET] nmcli {action} stderr: {err}")
+            if r.returncode != 0:
+                self.logger.error(f"[NET] nmcli {action} {conn} exited {r.returncode}")
+                return False
+            return True
+
+        self.logger.info(f"[NET] Rebouncing link '{conn}'...")
+        down_ok = _run("down")
+        time.sleep(max(0.0, self.network_rebounce_down_up_gap))
+        up_ok = _run("up")
+        time.sleep(max(0.0, self.network_rebounce_wait_after_up))
+        if up_ok:
+            self.logger.info(f"[NET] Link '{conn}' rebounced (down_ok={down_ok}, up_ok={up_ok})")
+        return up_ok
+
+    def _maybe_trigger_bounce_if_idle(self):
+        """If a rebounce is wanted and no uploads are in flight, run the coordinator off-thread."""
+        if not (self.network_rebounce_enabled and self._network_bounce_needed):
+            return
+        with self.upload_lock:
+            idle = self.active_uploads == 0
+        if idle:
+            threading.Thread(target=self._maybe_bounce_and_retry, daemon=True).start()
+
+    def _maybe_bounce_and_retry(self):
+        """Once all uploads have drained: bounce the link (cooldown-gated), reinit S3, retry pending."""
+        if not self._bounce_lock.acquire(blocking=False):
+            return  # a bounce is already running
+        try:
+            now = time.time()
+            since = now - self._last_bounce_ts
+            if since < self.network_rebounce_cooldown:
+                self.logger.info(
+                    f"[NET] Skipping rebounce (cooldown: {since:.0f}s < {self.network_rebounce_cooldown:.0f}s); "
+                    "pending uploads will be retried later"
+                )
+                return  # leave _network_bounce_needed set; periodic retry handles leftovers
+            self._last_bounce_ts = now
+            self._network_bounce_needed = False
+            self._rebounce_network()
+            self._init_s3_client(max_retries=2, retry_delay=min(30, float(self.upload_retry_backoff_cap)))
+            if self.s3_client is None:
+                self.logger.warning("[NET] S3 client still unavailable after rebounce; will retry later")
+                return
+            self.retry_pending_uploads()
+        except Exception as e:
+            self.logger.error(f"[NET] Error during rebounce/retry: {e}", exc_info=True)
+        finally:
+            self._bounce_lock.release()
+
     PENDING_CSV_HEADER = ["local_path", "s3_key", "filename", "failed_at", "video_code"]
 
     def _migrate_pending_csv_if_needed(self):
@@ -372,13 +480,18 @@ class CloudUploader:
                 if not video_code:
                     self.logger.warning("[API] POST main-video failed, continuing upload without backend notification")
 
+            uploaded = False
             for attempt in range(1, max_retries + 1):
                 try:
+                    # Guard: a prior failed reinit can leave s3_client=None — don't call
+                    # .upload_file on None (was raising AttributeError on the last attempt).
+                    if self.s3_client is None:
+                        raise RuntimeError("S3 client unavailable (None)")
                     size_mb = file_size / (1024 * 1024)
                     self.logger.info(f"[UPLOAD] Starting upload: {filename} -> {s3_key}")
                     self.logger.info(f"[UPLOAD] File size: {size_mb:.2f} MB - Attempt {attempt}/{max_retries}")
                     t0 = time.time()
-                    
+
                     # Upload with metadata
                     self.s3_client.upload_file(
                         local_path,
@@ -416,24 +529,33 @@ class CloudUploader:
                         except Exception as e:
                             self.logger.error(f"[UPLOAD] Failed to delete local file {local_path}: {e}", exc_info=True)
                     
+                    uploaded = True
                     break  # Success, exit retry loop
                 except Exception as e:
                     self.logger.error(f"[UPLOAD] Failed for {s3_key} (attempt {attempt}/{max_retries}): {e}", exc_info=True)
+                    if self.network_rebounce_enabled and self._is_connection_error(e):
+                        # Dead link: fail fast (skip the long inline reinit) so every upload
+                        # thread drains quickly. The coordinator then bounces the link once
+                        # (while nothing is in flight) and retries the pending uploads.
+                        self.logger.warning(f"[NET] Connection error; deferring '{filename}' to link rebounce")
+                        self._close_s3_connection()
+                        self._network_bounce_needed = True
+                        break
                     if attempt < max_retries:
                         self._close_s3_connection()
                         self._reinit_s3_client()
                         wait_time = self._retry_delays_seconds(attempt)
                         self.logger.info(f"[UPLOAD] Retrying upload in {wait_time:.1f} seconds...")
                         time.sleep(wait_time)
-                        if self.s3_client is None:
-                            continue
-                    else:
-                        self.logger.error(f"[UPLOAD] Failed after {max_retries} attempts. File: {local_path}")
-                        self._add_pending_upload(local_path, s3_key, filename, video_code=video_code)
-                        if self.api_client and video_code:
-                            dt = time.time() - t0
-                            upload_speed_mbps = (size_mb * 8) / dt if dt > 0 else 0
-                            self.api_client.put_main_video(video_code, int(dt), upload_speed_mbps, max_retries, "FAILED")
+                        continue
+
+            if not uploaded:
+                self.logger.error(f"[UPLOAD] Upload failed, queued for retry. File: {local_path}")
+                self._add_pending_upload(local_path, s3_key, filename, video_code=video_code)
+                if self.api_client and video_code:
+                    dt = time.time() - t0
+                    upload_speed_mbps = (size_mb * 8) / dt if dt > 0 else 0
+                    self.api_client.put_main_video(video_code, int(dt), upload_speed_mbps, max_retries, "FAILED")
 
         except Exception as e:
             self.logger.error(f"[UPLOAD] Unexpected error during upload pipeline for {filename}: {e}", exc_info=True)
@@ -443,6 +565,14 @@ class CloudUploader:
         """Queue one upload: bounded ThreadPoolExecutor plus semaphore (capacity = max concurrent)."""
         self._ensure_upload_limits()
         self._ensure_upload_executor_locked()
+        if self.s3_client is None and self.network_rebounce_enabled:
+            # Link is known-dead: don't block the caller (recording loop) on a long reinit.
+            # Park the file in pending and let the coordinator bounce + retry once idle.
+            self.logger.warning(f"[NET] No S3 client; parking '{filename}' for retry and scheduling rebounce")
+            self._add_pending_upload(local_path, s3_key, filename, video_code=video_code or None)
+            self._network_bounce_needed = True
+            self._maybe_trigger_bounce_if_idle()
+            return
         if self.s3_client is None:
             self.logger.warning(f"[UPLOAD] S3 client unavailable, skipping upload for {filename}")
             self._reinit_s3_client()
@@ -467,8 +597,13 @@ class CloudUploader:
             finally:
                 with self.upload_lock:
                     self.active_uploads -= 1
+                    drained = self.active_uploads == 0
                 self._upload_busy.release()
                 self.logger.info(f"[UPLOAD] Upload task finished for {filename}")
+                # When the last upload drains and a dead-link failure was flagged,
+                # bounce the link once (off-thread) and retry the pending uploads.
+                if drained and self.network_rebounce_enabled and self._network_bounce_needed:
+                    threading.Thread(target=self._maybe_bounce_and_retry, daemon=True).start()
 
         try:
             self._upload_executor.submit(run)
