@@ -31,10 +31,12 @@ def _get_pi_serial_id():
 class VideoRecorder:
     """Main orchestrator class that combines camera recording and cloud upload functionality."""
 
-    def __init__(self, config_file="config.conf", imx500_overlay=False):
+    def __init__(self, config_file="config.conf", imx500_overlay=False, upload_only=False):
         self.config = configparser.ConfigParser()
         self.config.read(config_file)
         self.imx500_overlay = bool(imx500_overlay)
+        # upload_only: skip camera + MQTT + startup auto-retry (used by --reconcile).
+        self.upload_only = bool(upload_only)
 
         # Setup logging with file handler
         self._setup_logging()
@@ -44,14 +46,27 @@ class VideoRecorder:
 
         # Initialize cloud uploader first (before camera) for pending retry
         self.cloud_uploader = CloudUploader(self.config, self.logger)
+
+        self.mqtt_client = None
+        if self.upload_only:
+            # Reconcile mode: no camera, no MQTT, no automatic retry — reconcile() drives uploads.
+            self.camera_recorder = None
+            return
+
         self.cloud_uploader.retry_pending_uploads()
 
         # Initialize camera recorder (cleanup will skip pending upload files)
         self.camera_recorder = CameraRecorder(self.config, self.logger, imx500_overlay=self.imx500_overlay)
 
         # Start MQTT sync-settings listener if BROKER and device_id available
-        self.mqtt_client = None
         self._start_mqtt_sync()
+
+    def reconcile(self):
+        """Upload all clips still saved on the SD card (pending + dead-letter), then return the count."""
+        try:
+            return self.cloud_uploader.reconcile()
+        finally:
+            self.cloud_uploader.cleanup()
 
     def _setup_logging(self):
         """Setup logging with both console and date-based file logging."""
@@ -400,7 +415,8 @@ class VideoRecorder:
                 self.mqtt_client.stop()
                 self.mqtt_client = None
             # Cleanup camera
-            self.camera_recorder.cleanup()
+            if self.camera_recorder is not None:
+                self.camera_recorder.cleanup()
             # Cleanup uploads
             self.cloud_uploader.cleanup()
         except Exception as e:

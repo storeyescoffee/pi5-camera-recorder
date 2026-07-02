@@ -115,11 +115,28 @@ def main():
     parser.add_argument("--config", default="config.conf", help="Configuration file path")
     parser.add_argument("--single", action="store_true", help="Record single video instead of continuous")
     parser.add_argument("--test", action="store_true", help="Test API and S3 connectivity, show settings")
+    parser.add_argument("--reconcile", action="store_true",
+                        help="Upload all clips still saved on the SD card (pending + dead-letter), then exit. Does not record.")
     parser.add_argument("--imx500", action="store_true", help="Overlay IMX500 bounding boxes on recorded frames (if metadata is present)")
     args = parser.parse_args()
 
     if args.test:
         return _run_test(args.config)
+
+    if args.reconcile:
+        try:
+            recorder = VideoRecorder(args.config, upload_only=True)
+            n = recorder.reconcile()
+            print(f"Reconcile complete: re-queued {n} clip(s).")
+            return 0
+        except KeyboardInterrupt:
+            print("\nReconcile interrupted by user")
+            return 1
+        except Exception as e:
+            print(f"Reconcile error: {e}")
+            import traceback
+            traceback.print_exc()
+            return 1
 
     pid_file = Path(__file__).resolve().parent / ".pid"
     try:

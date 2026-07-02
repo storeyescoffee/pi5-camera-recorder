@@ -43,6 +43,9 @@ class CloudUploader:
         self.active_uploads = 0
         self.upload_lock = threading.Lock()
         self.csv_lock = threading.Lock()
+        self._retry_lock = threading.Lock()  # serialize retry_pending_uploads passes (no overlapping retries)
+        self._inflight_lock = threading.Lock()
+        self._inflight = set()  # local_paths currently queued/uploading — dedup guard against double-queue
         self._reinit_lock = threading.Lock()  # serialize S3 close/reinit across upload worker threads
         self._bounce_lock = threading.Lock()  # serialize network rebounce + retry (one at a time)
         self._network_bounce_needed = False  # set when an upload fails on a dead link
@@ -113,6 +116,10 @@ class CloudUploader:
             self.bitrate = int(self.config.get("camera", "bitrate"))
             self.pending_uploads_csv = self.config.get("recording", "pending_uploads_csv", fallback="./pending_uploads.csv")
             self.pending_retry_interval_minutes = int(self.config.get("recording", "pending_retry_interval_minutes", fallback="10"))
+            # After this many genuine upload failures, stop retrying and move the clip to the
+            # dead-letter store (failed_uploads_csv) instead of endlessly re-queueing it.
+            self.max_pending_retries = max(1, int(self.config.get("recording", "max_pending_retries", fallback="3")))
+            self.failed_uploads_csv = self.config.get("recording", "failed_uploads_csv", fallback="./failed_uploads.csv")
             # urllib3 pool used by boto3 (avoid CLOSE-WAIT / pool exhaustion when max_concurrent_uploads > default 10)
             _mc = max(1, self.max_concurrent_uploads)
             _default_pool = str(max(_mc * 4, 32))
@@ -357,40 +364,96 @@ class CloudUploader:
         finally:
             self._bounce_lock.release()
 
-    PENDING_CSV_HEADER = ["local_path", "s3_key", "filename", "failed_at", "video_code"]
+    PENDING_CSV_HEADER = ["local_path", "s3_key", "filename", "failed_at", "video_code", "attempts"]
+    FAILED_CSV_HEADER = ["local_path", "s3_key", "filename", "failed_at", "video_code", "attempts", "reason"]
+
+    @staticmethod
+    def _parse_attempts(value):
+        """Best-effort int parse of the attempts column (handles '', None, floats)."""
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return 0
 
     def _migrate_pending_csv_if_needed(self):
-        """If CSV has old header (no video_code), migrate to new format."""
+        """Ensure the pending CSV has the current columns (video_code, attempts); migrate in place."""
         if not os.path.exists(self.pending_uploads_csv):
             return
         with open(self.pending_uploads_csv, "r", newline="", encoding="utf-8") as f:
             reader = csv.DictReader(f)
             fieldnames = list(reader.fieldnames or [])
             rows = list(reader)
-        if "video_code" in fieldnames:
+        if "video_code" in fieldnames and "attempts" in fieldnames:
             return
         for row in rows:
-            row["video_code"] = row.get("video_code", "")
+            row["video_code"] = row.get("video_code") or ""
+            if not row.get("attempts"):
+                row["attempts"] = "0"
         with open(self.pending_uploads_csv, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=self.PENDING_CSV_HEADER, extrasaction="ignore")
             writer.writeheader()
             writer.writerows(rows)
-        self.logger.info("[PENDING] Migrated CSV to include video_code column")
+        self.logger.info("[PENDING] Migrated CSV to current columns (video_code, attempts)")
 
-    def _add_pending_upload(self, local_path, s3_key, filename, video_code=None):
-        """Append failed upload info to CSV for later retry. video_code stored for fallback PUT."""
+    def _add_pending_upload(self, local_path, s3_key, filename, video_code=None, attempts=0):
+        """Record a failed upload for later retry. Deduplicates: one row per local_path (latest wins)."""
         with self.csv_lock:
             try:
                 self._migrate_pending_csv_if_needed()
-                file_exists = os.path.exists(self.pending_uploads_csv)
-                with open(self.pending_uploads_csv, "a", newline="", encoding="utf-8") as f:
-                    writer = csv.writer(f)
-                    if not file_exists:
-                        writer.writerow(self.PENDING_CSV_HEADER)
-                    writer.writerow([local_path, s3_key, filename, datetime.now().isoformat(), video_code or ""])
-                self.logger.info(f"[PENDING] Added to retry list: {filename}" + (f" (video_code={video_code})" if video_code else ""))
+                rows = []
+                if os.path.exists(self.pending_uploads_csv):
+                    with open(self.pending_uploads_csv, "r", newline="", encoding="utf-8") as f:
+                        for row in csv.DictReader(f):
+                            if row.get("local_path") != local_path:
+                                rows.append(row)
+                rows.append({
+                    "local_path": local_path,
+                    "s3_key": s3_key,
+                    "filename": filename,
+                    "failed_at": datetime.now().isoformat(),
+                    "video_code": video_code or "",
+                    "attempts": int(attempts),
+                })
+                with open(self.pending_uploads_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=self.PENDING_CSV_HEADER, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(rows)
+                self.logger.info(
+                    f"[PENDING] Queued for retry: {filename} (attempts={int(attempts)}"
+                    + (f", video_code={video_code}" if video_code else "") + ")"
+                )
             except Exception as e:
                 self.logger.error(f"[PENDING] Failed to write to CSV: {e}", exc_info=True)
+
+    def _add_failed_upload(self, local_path, s3_key, filename, video_code, attempts, reason):
+        """Persist a permanently-failed upload to the dead-letter store (kept on the SD card until
+        --reconcile). Deduplicates: one row per local_path (latest wins)."""
+        with self.csv_lock:
+            try:
+                rows = []
+                if os.path.exists(self.failed_uploads_csv):
+                    with open(self.failed_uploads_csv, "r", newline="", encoding="utf-8") as f:
+                        for row in csv.DictReader(f):
+                            if row.get("local_path") != local_path:
+                                rows.append(row)
+                rows.append({
+                    "local_path": local_path,
+                    "s3_key": s3_key,
+                    "filename": filename,
+                    "failed_at": datetime.now().isoformat(),
+                    "video_code": video_code or "",
+                    "attempts": int(attempts),
+                    "reason": reason,
+                })
+                with open(self.failed_uploads_csv, "w", newline="", encoding="utf-8") as f:
+                    writer = csv.DictWriter(f, fieldnames=self.FAILED_CSV_HEADER, extrasaction="ignore")
+                    writer.writeheader()
+                    writer.writerows(rows)
+                self.logger.error(
+                    f"[FAILED] Gave up after {int(attempts)} failure(s); saved to dead-letter store: {filename}"
+                )
+            except Exception as e:
+                self.logger.error(f"[FAILED] Could not write dead-letter CSV: {e}", exc_info=True)
     
     def _remove_pending_upload(self, local_path):
         """Remove entry from CSV after successful upload."""
@@ -413,7 +476,41 @@ class CloudUploader:
                 self.logger.debug(f"[PENDING] Removed from retry list: {local_path}")
             except Exception as e:
                 self.logger.error(f"[PENDING] Failed to update CSV: {e}", exc_info=True)
-    
+
+    def _remove_failed_upload(self, local_path):
+        """Remove an entry from the dead-letter store (after reconcile re-queues or drops it)."""
+        with self.csv_lock:
+            try:
+                if not os.path.exists(self.failed_uploads_csv):
+                    return
+                rows = []
+                with open(self.failed_uploads_csv, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    fieldnames = reader.fieldnames or []
+                    for row in reader:
+                        if row.get("local_path") != local_path:
+                            rows.append(row)
+                with open(self.failed_uploads_csv, "w", newline="", encoding="utf-8") as f:
+                    if rows and fieldnames:
+                        writer = csv.DictWriter(f, fieldnames=fieldnames)
+                        writer.writeheader()
+                        writer.writerows(rows)
+                self.logger.debug(f"[FAILED] Removed from dead-letter store: {local_path}")
+            except Exception as e:
+                self.logger.error(f"[FAILED] Failed to update dead-letter CSV: {e}", exc_info=True)
+
+    def get_failed_local_paths(self):
+        """Return set of local_paths currently in the dead-letter store (saved-on-SD clips)."""
+        if not os.path.exists(self.failed_uploads_csv):
+            return set()
+        with self.csv_lock:
+            try:
+                with open(self.failed_uploads_csv, "r", newline="", encoding="utf-8") as f:
+                    reader = csv.DictReader(f)
+                    return {row.get("local_path", "") for row in reader if row.get("local_path")}
+            except Exception:
+                return set()
+
     def _build_video_url(self, s3_key):
         """Build full video URL from s3_key. Uses video_url_base if set, else S3 public URL."""
         key = s3_key.lstrip("/")
@@ -432,17 +529,20 @@ class CloudUploader:
         return exp + random.uniform(0, jitter_max)
 
     def _upload_job_impl(
-        self, local_path, s3_key, filename, max_retries=3, is_fallback=False, existing_video_code=None, start_time=None
+        self, local_path, s3_key, filename, max_retries=3, is_fallback=False,
+        existing_video_code=None, start_time=None, pending_attempts=0,
     ):
         """Upload file to S3 with retry logic, metadata, and detailed statistics.
 
         is_fallback: True when retrying from pending CSV.
         existing_video_code: From CSV when POST succeeded but upload failed (scenario 1).
         start_time: Recording start time (datetime); if None, derived from file mtime - duration for retries.
+        pending_attempts: How many times this clip has already failed (drives the 3-strikes dead-letter).
         """
         if self.s3_client is None:
             self.logger.error(f"[UPLOAD] S3 client unavailable, cannot upload {s3_key}")
-            self._add_pending_upload(local_path, s3_key, filename, video_code=existing_video_code)
+            # Link/client is down — not a genuine upload failure, so don't burn an attempt.
+            self._add_pending_upload(local_path, s3_key, filename, video_code=existing_video_code, attempts=pending_attempts)
             return
 
         if not os.path.exists(local_path):
@@ -463,24 +563,29 @@ class CloudUploader:
 
             if is_fallback:
                 if video_code:
-                    # Scenario 1: POST succeeded, upload failed. Use stored video_code.
+                    # Scenario 1: POST succeeded, upload failed. Reuse stored video_code (no duplicate record).
                     if self.api_client:
-                        self.api_client.put_main_video(video_code, 0, 0.0, 1, "UPLOADING_FALLBACK")
+                        self.api_client.put_main_video(video_code, 0, 0.0, pending_attempts, "UPLOADING_FALLBACK")
                 else:
-                    # Scenario 2: Internet was down, POST failed. Resend POST.
+                    # Scenario 2: POST previously failed. Resend it (reuse code on the next retry).
                     if self.api_client:
                         video_url = self._build_video_url(s3_key)
                         video_code = self.api_client.post_main_video(video_url, file_size, duration_seconds, start_time, hour=start_time.hour)
-                        if not video_code:
+                        if video_code:
+                            self.api_client.put_main_video(video_code, 0, 0.0, pending_attempts, "UPLOADING_FALLBACK")
+                        else:
                             self.logger.warning("[API] POST main-video failed on retry")
             elif self.api_client:
-                # Normal flow: POST first
+                # Normal flow: POST to register, then mark UPLOADING so the record has an in-progress state.
                 video_url = self._build_video_url(s3_key)
                 video_code = self.api_client.post_main_video(video_url, file_size, duration_seconds, start_time, hour=start_time.hour)
-                if not video_code:
+                if video_code:
+                    self.api_client.put_main_video(video_code, 0, 0.0, 0, "UPLOADING")
+                else:
                     self.logger.warning("[API] POST main-video failed, continuing upload without backend notification")
 
             uploaded = False
+            dead_link_deferral = False
             for attempt in range(1, max_retries + 1):
                 try:
                     # Guard: a prior failed reinit can leave s3_client=None — don't call
@@ -515,20 +620,44 @@ class CloudUploader:
                     self.logger.info(f"[UPLOAD] Upload speed: {upload_speed_mbps:.2f} Mbps")
                     self.logger.info(f"[UPLOAD] Average upload rate: {size_mb/dt:.2f} MB/s")
                     
+                    # S3 upload succeeded. If the backend was never told about this clip
+                    # (POST failed earlier), register it now — the object exists, so losing
+                    # the record would be silent data loss.
+                    if self.api_client and not video_code:
+                        video_url = self._build_video_url(s3_key)
+                        video_code = self.api_client.post_main_video(
+                            video_url, file_size, duration_seconds, start_time, hour=start_time.hour
+                        )
+                        if not video_code:
+                            self.logger.warning(
+                                "[API] Upload OK but backend registration failed; keeping in pending to register later"
+                            )
+
                     if self.api_client and video_code:
                         status = "COMPLETED_FALLBACK" if is_fallback else "COMPLETED"
                         self.api_client.put_main_video(video_code, int(dt), upload_speed_mbps, attempt, status)
-                    
-                    # Remove from pending CSV if it was a retry
-                    self._remove_pending_upload(local_path)
-                    # Delete local file after successful upload if configured
-                    if self.delete_after_upload:
-                        try:
-                            os.remove(local_path)
-                            self.logger.info(f"[UPLOAD] Deleted local file: {local_path}")
-                        except Exception as e:
-                            self.logger.error(f"[UPLOAD] Failed to delete local file {local_path}: {e}", exc_info=True)
-                    
+                        # Success and recorded: drop from pending and optionally delete the local file.
+                        self._remove_pending_upload(local_path)
+                        if self.delete_after_upload:
+                            try:
+                                os.remove(local_path)
+                                self.logger.info(f"[UPLOAD] Deleted local file: {local_path}")
+                            except Exception as e:
+                                self.logger.error(f"[UPLOAD] Failed to delete local file {local_path}: {e}", exc_info=True)
+                    elif self.api_client:
+                        # Uploaded but could not register — keep the file and a pending row so a
+                        # later retry can register it (don't count this as a failure).
+                        self._add_pending_upload(local_path, s3_key, filename, video_code=None, attempts=pending_attempts)
+                    else:
+                        # No API client configured at all — just clean up pending/local as before.
+                        self._remove_pending_upload(local_path)
+                        if self.delete_after_upload:
+                            try:
+                                os.remove(local_path)
+                                self.logger.info(f"[UPLOAD] Deleted local file: {local_path}")
+                            except Exception as e:
+                                self.logger.error(f"[UPLOAD] Failed to delete local file {local_path}: {e}", exc_info=True)
+
                     uploaded = True
                     break  # Success, exit retry loop
                 except Exception as e:
@@ -536,10 +665,12 @@ class CloudUploader:
                     if self.network_rebounce_enabled and self._is_connection_error(e):
                         # Dead link: fail fast (skip the long inline reinit) so every upload
                         # thread drains quickly. The coordinator then bounces the link once
-                        # (while nothing is in flight) and retries the pending uploads.
+                        # (while nothing is in flight) and retries the pending uploads. This is a
+                        # network outage, not a genuine upload failure — don't burn a retry.
                         self.logger.warning(f"[NET] Connection error; deferring '{filename}' to link rebounce")
                         self._close_s3_connection()
                         self._network_bounce_needed = True
+                        dead_link_deferral = True
                         break
                     if attempt < max_retries:
                         self._close_s3_connection()
@@ -550,109 +681,223 @@ class CloudUploader:
                         continue
 
             if not uploaded:
-                self.logger.error(f"[UPLOAD] Upload failed, queued for retry. File: {local_path}")
-                self._add_pending_upload(local_path, s3_key, filename, video_code=video_code)
-                if self.api_client and video_code:
+                if dead_link_deferral:
+                    # Network down — keep in pending at the same attempt count for the rebounce
+                    # coordinator to retry. No FAILED status (the link can't carry it anyway).
+                    self.logger.warning(f"[UPLOAD] Deferred to link rebounce, kept in pending: {filename}")
+                    self._add_pending_upload(local_path, s3_key, filename, video_code=video_code, attempts=pending_attempts)
+                else:
+                    new_attempts = pending_attempts + 1
                     dt = time.time() - t0
                     upload_speed_mbps = (size_mb * 8) / dt if dt > 0 else 0
-                    self.api_client.put_main_video(video_code, int(dt), upload_speed_mbps, max_retries, "FAILED")
+                    if new_attempts >= self.max_pending_retries:
+                        # Three strikes: stop retrying, move to the dead-letter store, mark FAILED.
+                        self.logger.error(
+                            f"[UPLOAD] {filename} failed {new_attempts} time(s) (>= {self.max_pending_retries}); "
+                            "giving up and moving to dead-letter store"
+                        )
+                        self._remove_pending_upload(local_path)
+                        self._add_failed_upload(local_path, s3_key, filename, video_code, new_attempts, "max_retries_exceeded")
+                        if self.api_client and video_code:
+                            self.api_client.put_main_video(video_code, int(dt), upload_speed_mbps, new_attempts, "FAILED")
+                    else:
+                        self.logger.error(
+                            f"[UPLOAD] Upload failed (attempt {new_attempts}/{self.max_pending_retries}), queued for retry: {local_path}"
+                        )
+                        self._add_pending_upload(local_path, s3_key, filename, video_code=video_code, attempts=new_attempts)
 
         except Exception as e:
             self.logger.error(f"[UPLOAD] Unexpected error during upload pipeline for {filename}: {e}", exc_info=True)
             raise
 
-    def upload_file(self, local_path, s3_key, filename, is_fallback=False, video_code=None, start_time=None):
+    def upload_file(self, local_path, s3_key, filename, is_fallback=False, video_code=None, start_time=None, pending_attempts=0):
         """Queue one upload: bounded ThreadPoolExecutor plus semaphore (capacity = max concurrent)."""
         self._ensure_upload_limits()
         self._ensure_upload_executor_locked()
-        if self.s3_client is None and self.network_rebounce_enabled:
-            # Link is known-dead: don't block the caller (recording loop) on a long reinit.
-            # Park the file in pending and let the coordinator bounce + retry once idle.
-            self.logger.warning(f"[NET] No S3 client; parking '{filename}' for retry and scheduling rebounce")
-            self._add_pending_upload(local_path, s3_key, filename, video_code=video_code or None)
-            self._network_bounce_needed = True
-            self._maybe_trigger_bounce_if_idle()
-            return
-        if self.s3_client is None:
-            self.logger.warning(f"[UPLOAD] S3 client unavailable, skipping upload for {filename}")
-            self._reinit_s3_client()
-        if self.s3_client is None:
-            self.logger.error(f"[UPLOAD] Cannot queue upload (no S3 client): {filename}")
-            return
 
-        self._upload_busy.acquire()
-        with self.upload_lock:
-            self.active_uploads += 1
+        # Dedup guard: never queue the same file while a prior/concurrent attempt is in flight
+        # (startup, periodic, and rebounce retries can otherwise queue the same clip twice).
+        with self._inflight_lock:
+            if local_path in self._inflight:
+                self.logger.info(f"[UPLOAD] Already in flight, skipping duplicate queue: {filename}")
+                return
+            self._inflight.add(local_path)
 
-        def run():
+        submitted = False
+        try:
+            if self.s3_client is None and self.network_rebounce_enabled:
+                # Link is known-dead: don't block the caller (recording loop) on a long reinit.
+                # Park the file in pending and let the coordinator bounce + retry once idle.
+                self.logger.warning(f"[NET] No S3 client; parking '{filename}' for retry and scheduling rebounce")
+                self._add_pending_upload(local_path, s3_key, filename, video_code=video_code or None, attempts=pending_attempts)
+                self._network_bounce_needed = True
+                self._maybe_trigger_bounce_if_idle()
+                return
+            if self.s3_client is None:
+                self.logger.warning(f"[UPLOAD] S3 client unavailable, skipping upload for {filename}")
+                self._reinit_s3_client()
+            if self.s3_client is None:
+                # Still no client — park it so the clip isn't silently dropped.
+                self.logger.error(f"[UPLOAD] No S3 client; parking '{filename}' for later retry")
+                self._add_pending_upload(local_path, s3_key, filename, video_code=video_code or None, attempts=pending_attempts)
+                return
+
+            self._upload_busy.acquire()
+            with self.upload_lock:
+                self.active_uploads += 1
+
+            def run():
+                try:
+                    self._upload_job_impl(
+                        local_path,
+                        s3_key,
+                        filename,
+                        is_fallback=is_fallback,
+                        existing_video_code=video_code or None,
+                        start_time=start_time,
+                        pending_attempts=pending_attempts,
+                    )
+                finally:
+                    with self.upload_lock:
+                        self.active_uploads -= 1
+                        drained = self.active_uploads == 0
+                    self._upload_busy.release()
+                    with self._inflight_lock:
+                        self._inflight.discard(local_path)
+                    self.logger.info(f"[UPLOAD] Upload task finished for {filename}")
+                    # When the last upload drains and a dead-link failure was flagged,
+                    # bounce the link once (off-thread) and retry the pending uploads.
+                    if drained and self.network_rebounce_enabled and self._network_bounce_needed:
+                        threading.Thread(target=self._maybe_bounce_and_retry, daemon=True).start()
+
             try:
-                self._upload_job_impl(
-                    local_path,
-                    s3_key,
-                    filename,
-                    is_fallback=is_fallback,
-                    existing_video_code=video_code or None,
-                    start_time=start_time,
-                )
-            finally:
+                self._upload_executor.submit(run)
+                submitted = True
+            except Exception as e:
                 with self.upload_lock:
                     self.active_uploads -= 1
-                    drained = self.active_uploads == 0
                 self._upload_busy.release()
-                self.logger.info(f"[UPLOAD] Upload task finished for {filename}")
-                # When the last upload drains and a dead-link failure was flagged,
-                # bounce the link once (off-thread) and retry the pending uploads.
-                if drained and self.network_rebounce_enabled and self._network_bounce_needed:
-                    threading.Thread(target=self._maybe_bounce_and_retry, daemon=True).start()
-
-        try:
-            self._upload_executor.submit(run)
-        except Exception as e:
+                self.logger.error(f"[UPLOAD] Failed to queue upload for {filename}: {e}", exc_info=True)
+                raise
             with self.upload_lock:
-                self.active_uploads -= 1
-            self._upload_busy.release()
-            self.logger.error(f"[UPLOAD] Failed to queue upload for {filename}: {e}", exc_info=True)
-            raise
-        with self.upload_lock:
-            n = self.active_uploads
-        self.logger.info(f"[UPLOAD] Upload queued for {filename} (tracked active: {n})")
-    
+                n = self.active_uploads
+            self.logger.info(f"[UPLOAD] Upload queued for {filename} (tracked active: {n})")
+        finally:
+            # If we never handed the job to a worker, the run() finally never runs — release the
+            # in-flight slot here so the file can be queued again later.
+            if not submitted:
+                with self._inflight_lock:
+                    self._inflight.discard(local_path)
+
     def retry_pending_uploads(self):
         """Retry all uploads listed in pending_uploads.csv. Removes entries for missing files.
+        Clips that already failed max_pending_retries times are moved to the dead-letter store.
         Uses UPLOADING_FALLBACK then COMPLETED_FALLBACK when retrying."""
-        if not os.path.exists(self.pending_uploads_csv):
-            self.logger.info("[PENDING] No pending uploads file found")
+        # Serialize retry passes — startup, the periodic loop, and the rebounce coordinator can
+        # all call this; overlapping passes would double-queue the same rows.
+        if not self._retry_lock.acquire(blocking=False):
+            self.logger.info("[PENDING] Retry already in progress, skipping this pass")
+            return 0
+        try:
+            if not os.path.exists(self.pending_uploads_csv):
+                self.logger.info("[PENDING] No pending uploads file found")
+                return 0
+            with self.csv_lock:
+                self._migrate_pending_csv_if_needed()
+                try:
+                    with open(self.pending_uploads_csv, "r", newline="", encoding="utf-8") as f:
+                        reader = csv.DictReader(f)
+                        rows = list(reader)
+                except Exception as e:
+                    self.logger.error(f"[PENDING] Failed to read CSV: {e}", exc_info=True)
+                    return 0
+            if not rows:
+                return 0
+            self.logger.info(f"[PENDING] Retrying {len(rows)} pending upload(s)...")
+            count = 0
+            for row in rows:
+                local_path = row.get("local_path", "")
+                s3_key = row.get("s3_key", "")
+                filename = row.get("filename", os.path.basename(local_path))
+                if not local_path or not s3_key:
+                    continue
+                attempts = self._parse_attempts(row.get("attempts"))
+                if not os.path.exists(local_path):
+                    self.logger.warning(f"[PENDING] Skipping missing file, removing from list: {local_path}")
+                    self._remove_pending_upload(local_path)
+                    continue
+                if attempts >= self.max_pending_retries:
+                    # Safety net for rows already at the limit (e.g. legacy CSVs): dead-letter them.
+                    self.logger.error(
+                        f"[PENDING] {filename} already failed {attempts} time(s); moving to dead-letter, will not retry"
+                    )
+                    self._add_failed_upload(local_path, s3_key, filename, row.get("video_code") or "", attempts, "max_retries_exceeded")
+                    self._remove_pending_upload(local_path)
+                    continue
+                vc = (row.get("video_code") or "").strip() or None
+                self.upload_file(local_path, s3_key, filename, is_fallback=True, video_code=vc, pending_attempts=attempts)
+                count += 1
+            if count > 0:
+                self.wait_for_uploads(timeout=600)
+            return count
+        finally:
+            self._retry_lock.release()
+
+    def reconcile(self):
+        """One-shot manual pass: upload everything still saved on the SD card.
+
+        Covers (a) normal pending retries and (b) the dead-letter store — clips that
+        exhausted max_pending_retries and were parked on disk, untouched by the automatic
+        retries, waiting for an explicit --reconcile. Returns the number of clips re-queued.
+        """
+        self.logger.info("[RECONCILE] Starting manual reconcile of on-disk clips...")
+        total = self.retry_pending_uploads()
+        total += self.reconcile_failed_uploads()
+        self.logger.info(f"[RECONCILE] Done. Re-queued {total} clip(s).")
+        return total
+
+    def reconcile_failed_uploads(self):
+        """Re-drive the dead-letter store: re-upload each saved failed clip that still exists.
+
+        Each clip's attempt counter is reset so it gets a fresh retry budget; it is removed
+        from the dead-letter store before re-queueing (and re-added only if it fails again).
+        """
+        if not os.path.exists(self.failed_uploads_csv):
+            self.logger.info("[RECONCILE] No dead-letter store found")
             return 0
         with self.csv_lock:
-            self._migrate_pending_csv_if_needed()
             try:
-                with open(self.pending_uploads_csv, "r", newline="", encoding="utf-8") as f:
-                    reader = csv.DictReader(f)
-                    rows = list(reader)
+                with open(self.failed_uploads_csv, "r", newline="", encoding="utf-8") as f:
+                    rows = list(csv.DictReader(f))
             except Exception as e:
-                self.logger.error(f"[PENDING] Failed to read CSV: {e}", exc_info=True)
+                self.logger.error(f"[RECONCILE] Failed to read dead-letter CSV: {e}", exc_info=True)
                 return 0
         if not rows:
+            self.logger.info("[RECONCILE] Dead-letter store is empty")
             return 0
-        self.logger.info(f"[PENDING] Retrying {len(rows)} pending upload(s)...")
+        self.logger.info(f"[RECONCILE] Re-driving {len(rows)} saved (dead-letter) clip(s)...")
         count = 0
         for row in rows:
             local_path = row.get("local_path", "")
             s3_key = row.get("s3_key", "")
             filename = row.get("filename", os.path.basename(local_path))
             if not local_path or not s3_key:
+                self._remove_failed_upload(local_path)
                 continue
             if os.path.exists(local_path):
                 vc = (row.get("video_code") or "").strip() or None
-                self.upload_file(local_path, s3_key, filename, is_fallback=True, video_code=vc)
+                # Clear from the dead-letter store first; a fresh failure re-adds it only after
+                # another full max_pending_retries cycle.
+                self._remove_failed_upload(local_path)
+                self.upload_file(local_path, s3_key, filename, is_fallback=True, video_code=vc, pending_attempts=0)
                 count += 1
             else:
-                self.logger.warning(f"[PENDING] Skipping missing file, removing from list: {local_path}")
-                self._remove_pending_upload(local_path)
+                self.logger.warning(f"[RECONCILE] Saved clip missing, dropping from dead-letter: {local_path}")
+                self._remove_failed_upload(local_path)
         if count > 0:
-            self.wait_for_uploads(timeout=600)
+            self.wait_for_uploads(timeout=1800)
         return count
-    
+
     def get_pending_local_paths(self):
         """Return set of local_paths currently in pending CSV (for cleanup skip list)."""
         if not os.path.exists(self.pending_uploads_csv):
