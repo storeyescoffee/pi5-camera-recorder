@@ -14,6 +14,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
 import boto3
+from boto3.s3.transfer import TransferConfig
 from botocore.config import Config
 from botocore.exceptions import (
     ConnectionClosedError,
@@ -28,11 +29,11 @@ from api_client import create_api_client
 
 class CloudUploader:
     """Handles cloud storage uploads with retry logic and concurrent upload management."""
-    
+
     def __init__(self, config, logger=None):
         """
         Initialize CloudUploader.
-        
+
         Args:
             config: ConfigParser object with GCS/S3 settings
             logger: Optional logger instance (creates one if not provided)
@@ -52,6 +53,7 @@ class CloudUploader:
         self._last_bounce_ts = 0.0  # monotonic-ish wall clock of last bounce (cooldown gate)
         self.s3_client = None
         self.s3_region = None
+        self._transfer_config = None  # boto3 TransferConfig — controls multipart chunk size + per-file concurrency
         self._boto_session = None  # boto3.Session — one session, one pooled S3 client
         self._upload_executor = None  # bounded thread pool for uploads (never one OS thread per clip)
         self._upload_executor_workers = None
@@ -60,10 +62,11 @@ class CloudUploader:
         self.api_client = create_api_client(config, logger)
 
         self._load_config()
+        self._build_transfer_config()
         self._ensure_upload_limits()
         self._ensure_upload_executor_locked()
         self._init_s3_client()
-    
+
     def _get_aws_credentials_kwargs(self):
         """Return boto3 credential kwargs from config, if provided.
 
@@ -110,7 +113,9 @@ class CloudUploader:
             self.region = self.config.get("gcs", "region", fallback="us-east-1")
             
             # Recording settings needed for upload
-            self.max_concurrent_uploads = int(self.config.get("recording", "max_concurrent_uploads", fallback="3"))
+            # Default lowered to 2: on weak uplinks (Maroc Telecom) many parallel 443 streams
+            # get dropped mid-transfer. Fewer concurrent uploads = fewer mid-transfer failures.
+            self.max_concurrent_uploads = int(self.config.get("recording", "max_concurrent_uploads", fallback="2"))
             self.delete_after_upload = self.config.getboolean("recording", "delete_after_upload", fallback=False)
             self.recording_duration = int(self.config.get("recording", "duration_minutes"))
             self.bitrate = int(self.config.get("camera", "bitrate"))
@@ -118,7 +123,8 @@ class CloudUploader:
             self.pending_retry_interval_minutes = int(self.config.get("recording", "pending_retry_interval_minutes", fallback="10"))
             # After this many genuine upload failures, stop retrying and move the clip to the
             # dead-letter store (failed_uploads_csv) instead of endlessly re-queueing it.
-            self.max_pending_retries = max(1, int(self.config.get("recording", "max_pending_retries", fallback="3")))
+            # Raised to 5: 3 is too trigger-happy on a genuinely flaky link.
+            self.max_pending_retries = max(1, int(self.config.get("recording", "max_pending_retries", fallback="5")))
             self.failed_uploads_csv = self.config.get("recording", "failed_uploads_csv", fallback="./failed_uploads.csv")
             # urllib3 pool used by boto3 (avoid CLOSE-WAIT / pool exhaustion when max_concurrent_uploads > default 10)
             _mc = max(1, self.max_concurrent_uploads)
@@ -126,21 +132,28 @@ class CloudUploader:
             self.s3_pool_connections = int(self.config.get("recording", "s3_pool_connections", fallback=_default_pool))
             # App-level upload retries (distinct from botocore's internal retries on single request)
             self.upload_retry_backoff_initial = float(
-                self.config.get("recording", "upload_retry_backoff_initial_sec", fallback="2")
+                self.config.get("recording", "upload_retry_backoff_initial_sec", fallback="3")
             )
-            self.upload_retry_backoff_cap = float(self.config.get("recording", "upload_retry_backoff_cap_sec", fallback="120"))
+            self.upload_retry_backoff_cap = float(self.config.get("recording", "upload_retry_backoff_cap_sec", fallback="90"))
+
+            # Multipart transfer tuning (boto3 TransferConfig). Smaller per-file concurrency is the
+            # single biggest lever on a weak uplink: boto3 defaults to 10 internal threads PER file,
+            # which fight each other and get dropped. chunk size controls how much a dead part costs.
+            self.s3_multipart_chunk_mb = max(5, int(self.config.get("recording", "s3_multipart_chunk_mb", fallback="8")))
+            self.s3_upload_concurrency = max(1, int(self.config.get("recording", "s3_upload_concurrency", fallback="2")))
 
             # Network rebounce: auto-bounce the NetworkManager link when uploads fail on a dead link.
             self.network_rebounce_enabled = self.config.getboolean("recording", "network_rebounce_enabled", fallback=False)
             self.network_rebounce_connection = self.config.get("recording", "network_rebounce_connection", fallback="main-pi").strip()
-            self.network_rebounce_cooldown = float(self.config.get("recording", "network_rebounce_cooldown_sec", fallback="120"))
+            self.network_rebounce_cooldown = float(self.config.get("recording", "network_rebounce_cooldown_sec", fallback="90"))
             self.network_rebounce_wait_after_up = float(self.config.get("recording", "network_rebounce_wait_after_up_sec", fallback="15"))
             self.network_rebounce_down_up_gap = float(self.config.get("recording", "network_rebounce_down_up_gap_sec", fallback="2"))
             self.network_rebounce_cmd_timeout = float(self.config.get("recording", "network_rebounce_cmd_timeout_sec", fallback="30"))
             # S3 timeouts — low connect timeout detects a dead link fast; read stays high for large uploads.
-            self.s3_connect_timeout = int(self.config.get("recording", "s3_connect_timeout_sec", fallback="15"))
-            self.s3_read_timeout = int(self.config.get("recording", "s3_read_timeout_sec", fallback="300"))
-            self.s3_max_attempts = int(self.config.get("recording", "s3_max_attempts", fallback="3"))
+            # read lowered to 120: with 8MB chunks, 300s is too patient — a stalled part should fail fast.
+            self.s3_connect_timeout = int(self.config.get("recording", "s3_connect_timeout_sec", fallback="10"))
+            self.s3_read_timeout = int(self.config.get("recording", "s3_read_timeout_sec", fallback="120"))
+            self.s3_max_attempts = int(self.config.get("recording", "s3_max_attempts", fallback="5"))
 
             self.video_url_base = self.config.get("api", "video_url_base", fallback="").strip() if self.config.has_section("api") else ""
             
@@ -153,6 +166,26 @@ class CloudUploader:
         except Exception as e:
             self.logger.error(f"Error loading cloud upload configuration: {e}", exc_info=True)
             raise
+
+    def _build_transfer_config(self):
+        """Build the boto3 TransferConfig used by every upload_file call.
+
+        multipart_chunksize controls how much a dropped part wastes (smaller = cheaper retry).
+        max_concurrency caps the internal threads boto3 spins up PER file — the default of 10
+        overwhelms a weak uplink and causes the mid-transfer ConnectionClosedError seen on
+        partNumber=N. Keep this low (2) so parts upload sequentially-ish and survive.
+        """
+        chunk = self.s3_multipart_chunk_mb * 1024 * 1024
+        self._transfer_config = TransferConfig(
+            multipart_threshold=chunk,
+            multipart_chunksize=chunk,
+            max_concurrency=self.s3_upload_concurrency,
+            use_threads=True,
+        )
+        self.logger.info(
+            f"[UPLOAD] TransferConfig: chunk={self.s3_multipart_chunk_mb}MB, "
+            f"per-file concurrency={self.s3_upload_concurrency}"
+        )
 
     def _make_botocore_config(self):
         """Shared botocore Config: urllib3 pool size, timeouts, retries (reduces CLOSE-WAIT / stalls)."""
@@ -207,6 +240,7 @@ class CloudUploader:
     def reload_settings(self):
         """Reload configuration from config (e.g. after sync-settings MQTT message)."""
         self._load_config()
+        self._build_transfer_config()
         with self.upload_lock:
             self._ensure_upload_limits()
             self._ensure_upload_executor_locked()
@@ -597,7 +631,9 @@ class CloudUploader:
                     self.logger.info(f"[UPLOAD] File size: {size_mb:.2f} MB - Attempt {attempt}/{max_retries}")
                     t0 = time.time()
 
-                    # Upload with metadata
+                    # Upload with metadata. TransferConfig caps per-file internal concurrency
+                    # (default 10 -> 2) and sets multipart chunk size — this is the main fix for
+                    # the mid-transfer ConnectionClosedError on partNumber=N over a weak uplink.
                     self.s3_client.upload_file(
                         local_path,
                         self.bucket_name,
@@ -610,7 +646,8 @@ class CloudUploader:
                                 "file_size_bytes": str(file_size),
                                 "bitrate_bps": str(self.bitrate)
                             }
-                        }
+                        },
+                        Config=self._transfer_config,
                     )
                     
                     dt = time.time() - t0
@@ -934,7 +971,12 @@ class CloudUploader:
             timeout: Maximum time to wait in seconds (None = wait indefinitely)
         """
         start_time = time.time()
-        while self.active_uploads > 0:
+        while True:
+            # Read active_uploads under the same lock that increments/decrements it,
+            # so we never spin on (or exit early from) a stale value.
+            with self.upload_lock:
+                if self.active_uploads == 0:
+                    break
             if timeout and (time.time() - start_time) > timeout:
                 self.logger.warning(f"[UPLOAD] Timeout waiting for uploads after {timeout} seconds")
                 break
@@ -955,4 +997,3 @@ class CloudUploader:
             self._close_s3_connection()
         except Exception as e:
             self.logger.error(f"[CLEANUP] Error closing S3 client: {e}", exc_info=True)
-
