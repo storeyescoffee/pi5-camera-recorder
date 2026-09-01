@@ -24,6 +24,12 @@ from picamera2.outputs import FfmpegOutput
 from picamera2.platform import Platform, get_platform
 import libcamera
 
+try:
+    from PIL import Image, ImageDraw, ImageFont
+    _PIL_AVAILABLE = True
+except ImportError:
+    _PIL_AVAILABLE = False
+
 
 class FfmpegOutputLargeQueue(FfmpegOutput):
     """
@@ -72,7 +78,17 @@ class FfmpegOutputLargeQueue(FfmpegOutput):
 
 class CameraRecorder:
     """Handles camera setup and video recording functionality."""
-    
+
+    # Date/time overlay: fixed box in the top-right corner of the frame.
+    DATETIME_OVERLAY_BOX_WIDTH = 470
+    DATETIME_OVERLAY_BOX_HEIGHT = 52
+    DATETIME_OVERLAY_PAD = 20
+    DATETIME_OVERLAY_FONT_SIZE = 30
+    DATETIME_OVERLAY_FONT_PATHS = (
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    )
+
     def __init__(self, config, logger=None, imx500_overlay=False):
         """
         Initialize CameraRecorder.
@@ -90,11 +106,19 @@ class CameraRecorder:
         self._imx500_last_results = []
         self._recording_count = 0  # For periodic camera reinitialization
         self._pending_camera_reinit = False  # Set by reload_settings(); reinit before next recording
+        self._datetime_overlay_font = None
+        self._datetime_overlay_last_text = None
+        self._datetime_overlay_bright_mask = None
+        self._datetime_overlay_shadow_mask = None
 
         self._load_config()
         if self.use_rpicam_vid and self.imx500_overlay:
             self.logger.warning("[CONFIG] use_rpicam_vid disabled: not compatible with IMX500 overlay")
             self.use_rpicam_vid = False
+        if self.use_rpicam_vid and self.datetime_overlay:
+            self.logger.warning("[CONFIG] datetime_overlay disabled: not compatible with use_rpicam_vid (no PiCamera2 pre_callback)")
+            self.datetime_overlay = False
+        self._setup_datetime_overlay()
         Path(self.local_storage_path).mkdir(parents=True, exist_ok=True)
         
         # Clean up old recordings on startup
@@ -128,7 +152,8 @@ class CameraRecorder:
                 fallback="/usr/share/imx500-models/imx500_network_ssd_mobilenetv2_fpnlite_320x320_pp.rpk",
             ).strip()
             self.imx500_threshold = float(self.config.get("camera", "imx500_threshold", fallback="0.55"))
-            
+            self.datetime_overlay = self.config.getboolean("camera", "datetime_overlay", fallback=True)
+
             # Recording settings (from store settings API/cache only)
             self.recording_duration = int(self.config.get("recording", "duration_minutes"))
             self.video_naming_pattern = self.config.get("recording", "video_naming_pattern")
@@ -201,6 +226,9 @@ class CameraRecorder:
         If force_camera_reinit, marks camera for reinit so hardware settings (shutter, gain, flip)
         apply on next recording. Otherwise only in-memory config is updated."""
         self._load_config()
+        if self.use_rpicam_vid and self.datetime_overlay:
+            self.datetime_overlay = False
+        self._setup_datetime_overlay()
         if force_camera_reinit:
             self._pending_camera_reinit = True
             self.logger.info("[STORE] Camera settings reloaded (camera will reinit before next recording)")
@@ -454,6 +482,77 @@ class CameraRecorder:
                 # IMX500 helper returns x,y,w,h already in ISP output pixels.
                 self._draw_rect(img, x, y, x + w, y + h, color=color, thickness=2)
     
+    def _setup_datetime_overlay(self):
+        """Prepare the Pillow font for the date/time overlay.
+
+        Disables the overlay (with a warning) if Pillow isn't installed, rather than
+        failing the recording. If a bold TTF isn't found on disk either, leaves font=None
+        so PIL falls back to its built-in bitmap font.
+        """
+        if not self.datetime_overlay:
+            return
+        if not _PIL_AVAILABLE:
+            self.logger.warning("[OVERLAY] Pillow not installed; datetime overlay disabled (pip install Pillow)")
+            self.datetime_overlay = False
+            return
+
+        self._datetime_overlay_font = None
+        for font_path in self.DATETIME_OVERLAY_FONT_PATHS:
+            if os.path.isfile(font_path):
+                try:
+                    self._datetime_overlay_font = ImageFont.truetype(font_path, self.DATETIME_OVERLAY_FONT_SIZE)
+                    break
+                except Exception:
+                    continue
+
+        # Force a re-render on the next frame (font or config may have changed).
+        self._datetime_overlay_last_text = None
+        self._datetime_overlay_bright_mask = None
+        self._datetime_overlay_shadow_mask = None
+
+    def _render_datetime_overlay_masks(self, text):
+        """Render the overlay text into bright/shadow boolean masks using an offscreen
+        "L" (luminance) Pillow image, thresholded at >128."""
+        w, h = self.DATETIME_OVERLAY_BOX_WIDTH, self.DATETIME_OVERLAY_BOX_HEIGHT
+        bright_img = Image.new("L", (w, h), 0)
+        shadow_img = Image.new("L", (w, h), 0)
+        ImageDraw.Draw(shadow_img).text((2, 2), text, font=self._datetime_overlay_font, fill=255)
+        ImageDraw.Draw(bright_img).text((0, 0), text, font=self._datetime_overlay_font, fill=255)
+        bright_mask = np.array(bright_img) > 128
+        shadow_mask = np.array(shadow_img) > 128
+        return bright_mask, shadow_mask
+
+    def datetime_overlay_callback(self, request):
+        """picam2.pre_callback: burns a white-text/black-outline date/time overlay into the
+        top-right corner of every captured frame's luma plane, before encoding."""
+        text = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+        if text != self._datetime_overlay_last_text:
+            self._datetime_overlay_last_text = text
+            self._datetime_overlay_bright_mask, self._datetime_overlay_shadow_mask = (
+                self._render_datetime_overlay_masks(text)
+            )
+
+        bright_mask = self._datetime_overlay_bright_mask
+        shadow_mask = self._datetime_overlay_shadow_mask
+        if bright_mask is None:
+            return
+
+        box_w, box_h = self.DATETIME_OVERLAY_BOX_WIDTH, self.DATETIME_OVERLAY_BOX_HEIGHT
+        pad = self.DATETIME_OVERLAY_PAD
+
+        with MappedArray(request, "main") as m:
+            arr = m.array
+            if arr.ndim != 2:
+                # Luma-plane compositing only applies to raw YUV420 buffers.
+                return
+            frame_width = arr.shape[1]
+            x = frame_width - box_w - pad
+            y = pad
+            region = arr[y:y + box_h, x:x + box_w]
+            rh, rw = region.shape
+            region[shadow_mask[:rh, :rw]] = 16
+            region[bright_mask[:rh, :rw]] = 235
+
     def _setup_camera(self, max_retries=5, retry_delay=5):
         """Configure PiCamera2 with retry logic; or rpicam-vid-only mode (no Python camera)."""
         if self.use_rpicam_vid:
@@ -591,7 +690,8 @@ class CameraRecorder:
                             self._color_format_log = "RGB888 (with conversion in encoder)"
                             self.logger.info("Using RGB888 format - color conversion will be applied")
                 
-                # Optional per-frame overlay (runs before encoding).
+                # Optional per-frame overlays (run before encoding).
+                self.camera.pre_callback = self.datetime_overlay_callback if self.datetime_overlay else None
                 self.camera.post_callback = self.imx500_overlay_callback if self.imx500_overlay else None
                 self.camera.start()
                 
@@ -605,6 +705,9 @@ class CameraRecorder:
                 self.logger.info(f"Color format: {getattr(self, '_color_format_log', 'see above')}")
                 if self.imx500_overlay:
                     self.logger.info(f"[IMX500] Overlay enabled (model={getattr(self, 'imx500_model', '')})")
+                if self.datetime_overlay:
+                    font_desc = "bold TTF" if self._datetime_overlay_font is not None else "PIL default bitmap font"
+                    self.logger.info(f"[OVERLAY] Datetime overlay enabled ({font_desc})")
                 time.sleep(2)
                 return True
             except Exception as e:
