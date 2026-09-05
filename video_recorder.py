@@ -153,6 +153,15 @@ class VideoRecorder:
                     self.config.add_section("register")
                 self.config.set("register", "delta_time", str(dt))
                 self.logger.info(f"[STORE] Applied register delta-time: {dt}")
+            if "BUSINESS_HOUR" in settings:
+                bh = settings["BUSINESS_HOUR"]
+                if not self.config.has_section("business_hour"):
+                    self.config.add_section("business_hour")
+                for api_key, cfg_key in (("start-time", "start_time"), ("end-time", "end_time")):
+                    val = str(bh.get(api_key, "")).strip()
+                    if val:  # never clobber the config.conf fallback with an empty value
+                        self.config.set("business_hour", cfg_key, val)
+                        self.logger.info(f"[STORE] Applied {api_key}: {val}")
             if "CAMERA" in settings:
                 cam = settings["CAMERA"]
                 if "shutter-speed" in cam:
@@ -214,6 +223,9 @@ class VideoRecorder:
         "s3-location": ("gcs", "bucket_location", lambda v: str(v).strip()[5:] if str(v).strip().startswith("s3://") else str(v), False, True),
         # Register
         "delta-time": ("register", "delta_time", lambda v: str(v), False, False),
+        # Business hours - the session window is fixed at startup, so these take effect next session
+        "start-time": ("business_hour", "start_time", lambda v: str(v).strip(), False, False),
+        "end-time": ("business_hour", "end_time", lambda v: str(v).strip(), False, False),
     }
 
     def _apply_single_setting(self, name, value):
@@ -229,6 +241,8 @@ class VideoRecorder:
                 self.config.add_section(section)
             self.config.set(section, key, config_value)
             self.logger.info(f"[STORE] Applied {name}={config_value}")
+            if section == "business_hour":
+                self.logger.info("[STORE] Business-hour change takes effect at the next session, not the current one")
         except Exception as e:
             self.logger.warning(f"[STORE] Failed to apply {name}: {e}")
             return
@@ -243,7 +257,9 @@ class VideoRecorder:
         name_to_api = {"shutter-speed": ("CAMERA", "shutter-speed"), "analog-gain": ("CAMERA", "analog-gain"),
                       "flip": ("CAMERA", "flip"), "bitrate": ("CAMERA", "bitrate"),
                       "chunk-duration": ("RECORDING", "chunk-duration"), "s3-location": ("RECORDING", "s3-location"),
-                      "delta-time": ("REGISTER", "delta-time")}
+                      "delta-time": ("REGISTER", "delta-time"),
+                      "start-time": ("BUSINESS_HOUR", "start-time"),
+                      "end-time": ("BUSINESS_HOUR", "end-time")}
         path = name_to_api.get(name)
         if not path or not CACHE_SETTINGS_PATH.exists():
             return
@@ -320,8 +336,13 @@ class VideoRecorder:
         finally:
             self.cleanup()
 
-    def start_continuous_recording(self):
-        """Continuous recording loop with error recovery."""
+    def start_continuous_recording(self, deadline_ts=None):
+        """Continuous recording loop with error recovery.
+
+        deadline_ts: optional time.time() value marking the end of the business-hours
+        session. No new segment is started once it passes; the segment already running
+        is allowed to finish, so the session can overrun by up to one chunk.
+        """
         self.logger.info("Starting continuous recording loop...")
 
         # Initial camera setup
@@ -346,6 +367,10 @@ class VideoRecorder:
         try:
             while True:
                 try:
+                    if deadline_ts is not None and time.time() >= deadline_ts:
+                        self.logger.info("[SESSION] End-time reached; not starting another segment")
+                        break
+
                     # Check camera (or rpicam-vid binary) before recording
                     if not self.camera_recorder.is_ready_to_record():
                         self.logger.warning("Recorder not ready, attempting camera/setup...")

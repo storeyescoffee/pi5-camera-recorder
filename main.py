@@ -6,20 +6,27 @@ and Flexible Filename Placeholders
 
 import json
 import os
+import time
 import configparser
+from datetime import datetime
 from pathlib import Path
 
 from api_client import create_api_client
+from schedule import (
+    _clear_at_queue,
+    is_within_business_hours,
+    resolve_business_hours,
+    schedule_at,
+    seconds_until_end_time,
+)
 from video_recorder import CACHE_SETTINGS_PATH, VideoRecorder
 
 
-def _run_test(config_file="config.conf"):
-    """Check API and S3 connectivity, show all settings."""
-    config = configparser.ConfigParser()
-    config.read(config_file)
-    print("\n=== Pi Video Recorder - Connectivity Test ===\n")
+def _load_settings(config):
+    """Store settings from the API, falling back to cache/settings.json.
 
-    # API test
+    Returns (settings dict or None, api_ok bool).
+    """
     api_client = create_api_client(config, None)
     settings = None
     api_ok = False
@@ -32,6 +39,17 @@ def _run_test(config_file="config.conf"):
                 settings = json.load(f)
         except Exception:
             pass
+    return settings, api_ok
+
+
+def _run_test(config_file="config.conf"):
+    """Check API and S3 connectivity, show all settings."""
+    config = configparser.ConfigParser()
+    config.read(config_file)
+    print("\n=== Pi Video Recorder - Connectivity Test ===\n")
+
+    # API test
+    settings, api_ok = _load_settings(config)
     print(f"API:  {'OK' if api_ok else 'FAILED (using cache)' if settings else 'FAILED'}")
 
     # S3 test
@@ -118,6 +136,8 @@ def main():
     parser.add_argument("--reconcile", action="store_true",
                         help="Upload all clips still saved on the SD card (pending + dead-letter), then exit. Does not record.")
     parser.add_argument("--imx500", action="store_true", help="Overlay IMX500 bounding boxes on recorded frames (if metadata is present)")
+    parser.add_argument("--ignore-hours", action="store_true",
+                        help="Record at any hour, ignoring BUSINESS_HOUR and [business_hour] in config.conf")
     args = parser.parse_args()
 
     if args.test:
@@ -138,6 +158,32 @@ def main():
             traceback.print_exc()
             return 1
 
+    # Business-hours gate. Checked before VideoRecorder is built: that constructor blocks
+    # on S3 init and a pending-upload retry pass, which we must not pay just to find out
+    # we are outside the window. --single keeps its old unconditional behavior.
+    deadline_ts = None
+    if not args.single:
+        gate_config = configparser.ConfigParser()
+        gate_config.read(args.config)
+        settings, _ = _load_settings(gate_config)
+        start, end = resolve_business_hours(gate_config, settings, ignore=args.ignore_hours)
+
+        if start and end:
+            now = datetime.now()
+            if not is_within_business_hours(now, *start, *end):
+                print(f"Outside business hours, scheduling for start-time ({start[0]:02d}:{start[1]:02d})")
+                schedule_at(start[0], start[1], Path(__file__).resolve())
+                return 0
+            remaining = seconds_until_end_time(now, *end)
+            if remaining <= 0:
+                print("End-time already reached; nothing to record")
+                return 0
+            # Drop a stale queue-'a' job left over from before a reboot, so it cannot
+            # start a second recorder that fights this one for the camera.
+            _clear_at_queue("a")
+            deadline_ts = time.time() + remaining
+            print(f"Recording until end-time ({remaining}s remaining)")
+
     pid_file = Path(__file__).resolve().parent / ".pid"
     try:
         pid_file.write_text(str(os.getpid()), encoding="utf-8")
@@ -147,7 +193,9 @@ def main():
             if args.single:
                 recorder.record_single_video()
             else:
-                recorder.start_continuous_recording()
+                recorder.start_continuous_recording(deadline_ts=deadline_ts)
+                if deadline_ts is not None:
+                    print("Session ended at end-time; exiting")
 
         except KeyboardInterrupt:
             print("\nRecording stopped by user")
