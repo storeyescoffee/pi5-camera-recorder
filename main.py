@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Raspberry Pi 5 Video Recorder with Automatic AWS S3 Region Detection
+Raspberry Pi 4 / Pi 5 Video Recorder with Automatic AWS S3 Region Detection
 and Flexible Filename Placeholders
 """
 

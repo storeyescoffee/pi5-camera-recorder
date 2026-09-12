@@ -1,7 +1,11 @@
 #!/usr/bin/env python3
 """
-Camera Recording Module for Raspberry Pi 5
+Camera Recording Module for Raspberry Pi 4 and Raspberry Pi 5
 Handles all camera setup, video recording, and file management.
+
+Encoding backends (PiCamera2 path):
+- Pi 4 (VC4): V4L2 hardware H.264 encoder (/dev/video11), max 1920x1080.
+- Pi 5 (PISP): no hardware encoder; Libav software H.264 (libx264).
 """
 
 import csv
@@ -19,10 +23,14 @@ import numpy as np
 import av
 import prctl
 from picamera2 import Picamera2, MappedArray
-from picamera2.encoders import H264Encoder
 from picamera2.outputs import FfmpegOutput
 from picamera2.platform import Platform, get_platform
 import libcamera
+
+try:
+    from picamera2.encoders import LibavH264Encoder
+except ImportError:  # very old picamera2 (Pi 4 / Bullseye) without the Libav encoders
+    LibavH264Encoder = None
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -89,6 +97,13 @@ class CameraRecorder:
         "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
     )
 
+    # Pi 4 (VC4) V4L2 hardware H.264 encoder limits.
+    HW_H264_DEVICE = "/dev/video11"
+    HW_H264_MAX_WIDTH = 1920
+    HW_H264_MAX_HEIGHT = 1080
+    HW_H264_MAX_FPS = 30
+    HW_H264_MAX_BITRATE = 25_000_000
+
     def __init__(self, config, logger=None, imx500_overlay=False):
         """
         Initialize CameraRecorder.
@@ -112,6 +127,9 @@ class CameraRecorder:
         self._datetime_overlay_shadow_mask = None
 
         self._load_config()
+        # Resolved per camera setup by _select_encoder_backend().
+        self.use_hw_encoder = False
+        self.capture_size = (self.resolution_width, self.resolution_height)
         if self.use_rpicam_vid and self.imx500_overlay:
             self.logger.warning("[CONFIG] use_rpicam_vid disabled: not compatible with IMX500 overlay")
             self.use_rpicam_vid = False
@@ -153,6 +171,11 @@ class CameraRecorder:
             ).strip()
             self.imx500_threshold = float(self.config.get("camera", "imx500_threshold", fallback="0.55"))
             self.datetime_overlay = self.config.getboolean("camera", "datetime_overlay", fallback=True)
+            # H.264 encoder: auto (hardware on Pi 4, software on Pi 5) | hardware | software
+            self.encoder_mode = (self.config.get("camera", "encoder", fallback="auto") or "auto").strip().lower()
+            if self.encoder_mode not in ("auto", "hardware", "software"):
+                self.logger.warning(f"[CONFIG] Unknown camera.encoder '{self.encoder_mode}', using 'auto'")
+                self.encoder_mode = "auto"
 
             # Recording settings (from store settings API/cache only)
             self.recording_duration = int(self.config.get("recording", "duration_minutes"))
@@ -213,13 +236,81 @@ class CameraRecorder:
             "--gain", str(self.analog_gain),
             "--inline",
         ]
-        if self.rpicam_codec and self.rpicam_codec != "h264":
-            cmd.extend(["--codec", self.rpicam_codec])
+        codec = self.rpicam_codec
+        if self.encoder_mode == "software" and codec == "h264":
+            # rpicam-vid's "h264" codec is the V4L2 hardware encoder on Pi 4.
+            codec = "libav"
+        if codec and codec != "h264":
+            cmd.extend(["--codec", codec])
         if self.reverse_camera:
             cmd.extend(["--hflip", "--vflip"])
         if self.rpicam_extra_args:
             cmd.extend(shlex.split(self.rpicam_extra_args))
         return cmd
+
+    def _hardware_encoder_available(self):
+        """True on Pi 4 (VC4) when the V4L2 H.264 encoder device node exists. Pi 5 has no HW encoder."""
+        return get_platform() == Platform.VC4 and os.path.exists(self.HW_H264_DEVICE)
+
+    def _select_encoder_backend(self):
+        """Pick hardware (Pi 4 V4L2) or software (Libav) H.264 and the capture size it can handle.
+        Sets self.use_hw_encoder and self.capture_size."""
+        platform_name = "Pi 4 (VC4)" if get_platform() == Platform.VC4 else "Pi 5 (PISP)"
+        hw_available = self._hardware_encoder_available()
+
+        if self.encoder_mode == "software" and LibavH264Encoder is not None:
+            use_hw = False
+        elif hw_available:
+            use_hw = True
+            if self.encoder_mode == "software":
+                self.logger.warning("[ENCODER] Software encoder requested but LibavH264Encoder unavailable; using hardware")
+        else:
+            use_hw = False
+            if self.encoder_mode == "hardware":
+                self.logger.warning(
+                    f"[ENCODER] Hardware encoder requested but not available on {platform_name} "
+                    f"({self.HW_H264_DEVICE} missing); falling back to software"
+                )
+        if not use_hw and LibavH264Encoder is None:
+            raise RuntimeError("No H.264 encoder available (no hardware encoder and picamera2 lacks LibavH264Encoder)")
+
+        w, h = self.resolution_width, self.resolution_height
+        if use_hw:
+            if w > self.HW_H264_MAX_WIDTH or h > self.HW_H264_MAX_HEIGHT:
+                scale = min(self.HW_H264_MAX_WIDTH / w, self.HW_H264_MAX_HEIGHT / h)
+                new_w, new_h = int(w * scale) & ~1, int(h * scale) & ~1
+                self.logger.warning(
+                    f"[ENCODER] {w}x{h} exceeds hardware H.264 limit "
+                    f"({self.HW_H264_MAX_WIDTH}x{self.HW_H264_MAX_HEIGHT}); capturing at {new_w}x{new_h}"
+                )
+                w, h = new_w, new_h
+            if self.fps > self.HW_H264_MAX_FPS:
+                self.logger.warning(
+                    f"[ENCODER] {self.fps}fps exceeds hardware H.264 1080p limit ({self.HW_H264_MAX_FPS}fps); frames may drop"
+                )
+
+        self.use_hw_encoder = use_hw
+        self.capture_size = (w, h)
+        backend = "V4L2 hardware H.264" if use_hw else "Libav software H.264"
+        self.logger.info(f"[ENCODER] Platform {platform_name}, encoder={self.encoder_mode} -> {backend}")
+
+    def _create_encoder(self):
+        """Create a fresh H.264 encoder for the selected backend (never reuse one across recordings)."""
+        if self.use_hw_encoder:
+            from picamera2.encoders.h264_encoder import H264Encoder as V4L2H264Encoder
+            bitrate = self.bitrate
+            if bitrate > self.HW_H264_MAX_BITRATE:
+                self.logger.warning(
+                    f"[ENCODER] Bitrate {bitrate} above hardware limit; clamping to {self.HW_H264_MAX_BITRATE}"
+                )
+                bitrate = self.HW_H264_MAX_BITRATE
+            try:
+                return V4L2H264Encoder(bitrate=bitrate, repeat=True, iperiod=self.fps, framerate=self.fps)
+            except TypeError:
+                # Older picamera2 V4L2 encoder has no framerate kwarg.
+                return V4L2H264Encoder(bitrate=bitrate, repeat=True, iperiod=self.fps)
+        # Libav defaults framerate=30; must match self.fps for correct timing/bitrate.
+        return LibavH264Encoder(bitrate=self.bitrate, framerate=self.fps, iperiod=self.fps, repeat=True)
 
     def reload_settings(self, force_camera_reinit=True):
         """Reload configuration from config (e.g. after sync-settings MQTT message).
@@ -574,6 +665,13 @@ class CameraRecorder:
             )
             return True
 
+        try:
+            self._select_encoder_backend()
+        except Exception as e:
+            self.logger.error(f"[ENCODER] {e}")
+            return False
+        capture_w, capture_h = self.capture_size
+
         for attempt in range(1, max_retries + 1):
             try:
                 # Clean up previous camera instance; use full reset for thorough release
@@ -613,7 +711,7 @@ class CameraRecorder:
                     self.logger.info(f"Forcing color format to: {self.force_color_format}")
                     try:
                         video_config = self.camera.create_video_configuration(
-                            main={"size": (self.resolution_width, self.resolution_height), "format": self.force_color_format},
+                            main={"size": (capture_w, capture_h), "format": self.force_color_format},
                             controls={
                                 "ExposureTime": self.shutter_speed,
                                 "AnalogueGain": self.analog_gain,
@@ -629,14 +727,14 @@ class CameraRecorder:
                         self.logger.error(f"Failed to configure camera with forced format {self.force_color_format}: {forced_error}")
                         raise
                 else:
-                    # Pi 4 (VC4): H.264 is V4L2 hardware; BGR is a good default.
-                    # Pi 5 (PISP): H264Encoder is Libav/libx264 (no HW encode). YUV420 main avoids
-                    # a heavy RGB→YUV path in the encoder. IMX500 overlay needs RGB-style buffers; keep BGR.
+                    # YUV420 is the native input of both the Pi 4 V4L2 hardware encoder and Libav
+                    # on Pi 5 (no RGB->YUV conversion), and the datetime overlay draws on its luma
+                    # plane. IMX500 overlay needs RGB-style buffers; keep BGR for it.
                     yuv_tried = False
-                    if get_platform() != Platform.VC4 and not self.imx500_overlay:
+                    if not self.imx500_overlay:
                         try:
                             video_config = self.camera.create_video_configuration(
-                                main={"size": (self.resolution_width, self.resolution_height), "format": "YUV420"},
+                                main={"size": (capture_w, capture_h), "format": "YUV420"},
                                 controls={
                                     "ExposureTime": self.shutter_speed,
                                     "AnalogueGain": self.analog_gain,
@@ -648,17 +746,18 @@ class CameraRecorder:
                             )
                             self.camera.configure(video_config)
                             self.use_bgr_format = False
-                            self._color_format_log = "YUV420 (Libav H.264; best CPU on Pi 5)"
+                            encoder_desc = "V4L2 hardware H.264" if self.use_hw_encoder else "Libav software H.264"
+                            self._color_format_log = f"YUV420 ({encoder_desc})"
                             yuv_tried = True
-                            self.logger.info("Using YUV420 for software H.264 (reduces load vs BGR on Pi 5+)")
+                            self.logger.info(f"Using YUV420 main stream for {encoder_desc}")
                         except Exception as yuv_e:
                             self.logger.warning(f"YUV420 main not available, trying BGR888: {yuv_e}")
 
                     if not yuv_tried:
-                        # BGR888 first on Pi 4 (hw encode), or fallback on Pi 5
+                        # BGR888 for IMX500 overlay, or fallback if YUV420 is unavailable
                         try:
                             video_config = self.camera.create_video_configuration(
-                                main={"size": (self.resolution_width, self.resolution_height), "format": "BGR888"},
+                                main={"size": (capture_w, capture_h), "format": "BGR888"},
                                 controls={
                                     "ExposureTime": self.shutter_speed,
                                     "AnalogueGain": self.analog_gain,
@@ -670,14 +769,14 @@ class CameraRecorder:
                             )
                             self.camera.configure(video_config)
                             self.use_bgr_format = True
-                            bgr_msg = "BGR888 — V4L2 H.264 has no BGR->YUV in userspace" if get_platform() == Platform.VC4 else "BGR888 — Libav H.264 converts to YUV (higher CPU on Pi 5)"
+                            bgr_msg = "BGR888 — V4L2 hardware H.264 converts to YUV" if self.use_hw_encoder else "BGR888 — Libav H.264 converts to YUV (higher CPU)"
                             self._color_format_log = bgr_msg
-                            self.logger.info("Using BGR888 format" + (" - preferred for hardware encoder (Pi 4)" if get_platform() == Platform.VC4 else ""))
+                            self.logger.info("Using BGR888 format")
                         except Exception as bgr_error:
                             # Fallback to RGB888 if BGR888 is not supported
                             self.logger.warning(f"BGR888 format not supported, falling back to RGB888: {bgr_error}")
                             video_config = self.camera.create_video_configuration(
-                                main={"size": (self.resolution_width, self.resolution_height), "format": "RGB888"},
+                                main={"size": (capture_w, capture_h), "format": "RGB888"},
                                 controls={
                                     "ExposureTime": self.shutter_speed,
                                     "AnalogueGain": self.analog_gain,
@@ -698,7 +797,7 @@ class CameraRecorder:
                 # Check and display supported formats for debugging
                 self._check_camera_formats()
                 
-                self.logger.info(f"Camera started at {self.resolution_width}x{self.resolution_height}@{self.fps}fps")
+                self.logger.info(f"Camera started at {capture_w}x{capture_h}@{self.fps}fps")
                 self.logger.info(f"Frame duration: {frame_duration_us}μs (target: {1_000_000/self.fps:.1f}μs)")
                 self.logger.info(f"Analog gain: {self.analog_gain}, Shutter speed: {self.shutter_speed}μs")
                 self.logger.info(f"Bitrate: {self.bitrate/1_000_000:.1f}Mbps")
@@ -780,7 +879,7 @@ class CameraRecorder:
         Caller MUST create a NEW encoder before retry - never reuse a failed encoder.
 
         Args:
-            enc: H264Encoder instance
+            enc: H.264 encoder instance (from _create_encoder)
             out: FfmpegOutput instance
             local_path: Output file path (for logging)
 
@@ -976,16 +1075,11 @@ class CameraRecorder:
                 return True, local_path, s3_key, filename
 
             self.logger.info(
-                f"[RECORD] Recording {duration_seconds}s at {self.fps}fps using PiCamera2..."
+                f"[RECORD] Recording {duration_seconds}s at {self.fps}fps using PiCamera2 "
+                f"({'hardware' if self.use_hw_encoder else 'software'} H.264)..."
             )
 
-            # Libav H.264 on Pi 5 defaults framerate=30; must match self.fps for correct timing/bitrate.
-            enc = H264Encoder(
-                bitrate=self.bitrate,
-                framerate=self.fps,
-                iperiod=self.fps,
-                repeat=True,
-            )
+            enc = self._create_encoder()
             queue_size = getattr(self, "ffmpeg_video_thread_queue_size", 512)
             out = FfmpegOutputLargeQueue(local_path, video_thread_queue_size=queue_size)
 
@@ -995,12 +1089,7 @@ class CameraRecorder:
             started = self._safe_start_recording(enc, out, local_path)
             if not started:
                 self.logger.info("[RECORD] Retrying with fresh encoder after full camera reset...")
-                enc = H264Encoder(
-                    bitrate=self.bitrate,
-                    framerate=self.fps,
-                    iperiod=self.fps,
-                    repeat=True,
-                )
+                enc = self._create_encoder()
                 out = FfmpegOutputLargeQueue(local_path, video_thread_queue_size=queue_size)
                 started = self._safe_start_recording(enc, out, local_path)
             if not started:
