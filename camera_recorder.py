@@ -722,14 +722,14 @@ class CameraRecorder:
                             self._imx500_intrinsics.update_with_defaults()
                         except Exception:
                             pass
-                        self.camera = Picamera2(self._imx500.camera_num)
+                        self.camera = self._open_picamera2(self._imx500.camera_num)
                     except Exception as e:
                         self.logger.warning(f"[IMX500] Failed to initialize IMX500 helper, overlay disabled: {e}")
                         self._imx500 = None
                         self._imx500_intrinsics = None
-                        self.camera = Picamera2()
+                        self.camera = self._open_picamera2()
                 else:
-                    self.camera = Picamera2()
+                    self.camera = self._open_picamera2()
                 frame_duration_us = int(1_000_000 / self.fps)
                 
                 # Check if color format is forced in config
@@ -837,6 +837,8 @@ class CameraRecorder:
                 return True
             except Exception as e:
                 self.logger.error(f"Camera setup failed (attempt {attempt}/{max_retries}): {e}", exc_info=True)
+                # Opened but configure/start failed: release the camera and its fds before retrying.
+                self._close_camera_instance(self.camera)
                 self.camera = None
                 gc.collect()
                 if attempt < max_retries:
@@ -874,14 +876,47 @@ class CameraRecorder:
             self.camera.stop()
         except Exception:
             pass
-        try:
-            self.camera.close()
-        except Exception:
-            pass
+        self._close_camera_instance(self.camera)
         self.camera = None
         gc.collect()
         time.sleep(2.5)
         self.logger.info("[RECOVERY] Full camera reset complete")
+
+    @staticmethod
+    def _close_notify_pipe(cam):
+        """Close Picamera2's internal notify pipe. Only call when picamera2's close() has not
+        (and will not) close it: close() returns early while is_open is False, and __init__
+        creates the pipe before opening the camera, so every failed open leaks 2 fds."""
+        for close_fn in (lambda: cam.notifymeread.close(), lambda: os.close(cam.notifyme_w)):
+            try:
+                close_fn()
+            except Exception:
+                pass
+
+    def _close_camera_instance(self, cam):
+        """close() a Picamera2 instance without leaking its notify pipe if close() fails."""
+        if cam is None:
+            return
+        try:
+            cam.close()
+        except Exception as e:
+            self.logger.warning(f"[RECOVERY] Camera close failed: {e}")
+            # close() sets is_open=False right before closing the pipe; still True means it never got there.
+            if getattr(cam, "is_open", False):
+                self._close_notify_pipe(cam)
+
+    def _open_picamera2(self, camera_num=0):
+        """Picamera2(camera_num), closing its fds if __init__ fails (e.g. camera not detected)."""
+        cam = Picamera2.__new__(Picamera2)
+        try:
+            cam.__init__(camera_num)
+            return cam
+        except Exception:
+            if getattr(cam, "is_open", False):
+                self._close_camera_instance(cam)  # camera acquired but later init step failed
+            else:
+                self._close_notify_pipe(cam)
+            raise
 
     def _safe_stop_recording(self):
         """

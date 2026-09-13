@@ -127,7 +127,22 @@ def _run_test(config_file="config.conf"):
     return 0 if (settings and (api_ok or s3_ok)) else 1
 
 
+def _raise_open_files_limit():
+    """Raise the soft RLIMIT_NOFILE to the hard limit (default soft 1024 can be exhausted on a
+    24/7 recorder). Safety net only; leaks must still be fixed at the source."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        if hard == resource.RLIM_INFINITY:
+            hard = max(soft, 65536)
+        if soft < hard:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (hard, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def main():
+    _raise_open_files_limit()
     import argparse
     parser = argparse.ArgumentParser(description="Pi Video Recorder Uploader")
     parser.add_argument("--config", default="config.conf", help="Configuration file path")
