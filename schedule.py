@@ -5,6 +5,7 @@ holds the next recording-session start; nothing else uses that queue.
 """
 
 import logging
+import shlex
 import shutil
 import subprocess
 from datetime import datetime, timedelta
@@ -77,8 +78,10 @@ def _clear_at_queue(queue="a"):
         pass
 
 
-def schedule_at(start_h, start_m, script_path=None):
+def schedule_at(start_h, start_m, script_path=None, extra_args=None):
     """Schedule main.py to run at start-time using at(1), queue 'a'.
+
+    extra_args: CLI flags to pass to the scheduled run (e.g. ["-v2"]) so the mode persists.
 
     Drops existing queue-'a' jobs first. A missing at(1) is logged and ignored —
     the recorder must not die because scheduling is unavailable.
@@ -91,6 +94,8 @@ def schedule_at(start_h, start_m, script_path=None):
 
     script = Path(script_path) if script_path else Path(__file__).resolve().parent / "main.py"
     cmd = f"cd {script.parent} && python3 {script}"
+    if extra_args:
+        cmd += " " + " ".join(shlex.quote(a) for a in extra_args)
 
     now = datetime.now()
     start_dt = next_start_datetime(now, start_h, start_m)

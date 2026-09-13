@@ -18,12 +18,15 @@ CACHE_SETTINGS_PATH = Path("cache/settings.json")
 class VideoRecorder:
     """Main orchestrator class that combines camera recording and cloud upload functionality."""
 
-    def __init__(self, config_file="config.conf", imx500_overlay=False, upload_only=False):
+    def __init__(self, config_file="config.conf", imx500_overlay=False, upload_only=False, defer_uploads=False):
         self.config = configparser.ConfigParser()
         self.config.read(config_file)
         self.imx500_overlay = bool(imx500_overlay)
         # upload_only: skip camera + startup auto-retry (used by --reconcile).
         self.upload_only = bool(upload_only)
+        # defer_uploads (-v2): hold every upload until the business-hours session ends, so TLS
+        # uploads never compete with capture on the Pi 4.
+        self.defer_uploads = bool(defer_uploads)
 
         # Setup logging with file handler
         self._setup_logging()
@@ -39,7 +42,10 @@ class VideoRecorder:
             self.camera_recorder = None
             return
 
-        self.cloud_uploader.retry_pending_uploads()
+        if self.defer_uploads:
+            self.logger.info("[DEFER] Uploads held until end of business hours (-v2)")
+        else:
+            self.cloud_uploader.retry_pending_uploads()
 
         # Initialize camera recorder (cleanup will skip pending upload files)
         self.camera_recorder = CameraRecorder(self.config, self.logger, imx500_overlay=self.imx500_overlay)
@@ -214,6 +220,8 @@ class VideoRecorder:
             # Show upload estimates
             self.cloud_uploader.estimate_file_size_and_upload_time()
 
+        session_ended = False
+        upload_callback = self.cloud_uploader.defer_upload if self.defer_uploads else self.cloud_uploader.upload_file
         consecutive_errors = 0
         max_consecutive_errors = 10
         error_backoff = 5  # seconds
@@ -231,6 +239,7 @@ class VideoRecorder:
                 try:
                     if deadline_ts is not None and time.time() >= deadline_ts:
                         self.logger.info("[SESSION] End-time reached; not starting another segment")
+                        session_ended = True
                         break
 
                     # Check camera (or rpicam-vid binary) before recording
@@ -246,14 +255,14 @@ class VideoRecorder:
                                 consecutive_errors = 0
                             continue
 
-                    # Periodic retry of pending uploads
-                    if retry_interval_sec > 0 and (time.time() - last_pending_retry) >= retry_interval_sec:
+                    # Periodic retry of pending uploads (held clips wait for the session end under -v2)
+                    if not self.defer_uploads and retry_interval_sec > 0 and (time.time() - last_pending_retry) >= retry_interval_sec:
                         self.cloud_uploader.retry_pending_uploads()
                         last_pending_retry = time.time()
 
                     # Attempt to record
                     success, local_path, s3_key, filename = self.camera_recorder.record_video(
-                        upload_callback=self.cloud_uploader.upload_file
+                        upload_callback=upload_callback
                     )
 
                     if success:
@@ -293,14 +302,39 @@ class VideoRecorder:
         except Exception as e:
             self.logger.error(f"Fatal error in main loop: {e}", exc_info=True)
         finally:
-            self.cleanup()
+            # Only a normal end-of-session flushes held clips; a stop/crash leaves them in pending.
+            self.cleanup(upload_deferred=self.defer_uploads and session_ended)
 
-    def cleanup(self):
-        """Cleanup resources and wait for uploads to finish."""
+    @staticmethod
+    def pending_uploads_exist(config_file="config.conf"):
+        """True if pending_uploads.csv has any row — checked before paying for S3 init."""
+        config = configparser.ConfigParser()
+        config.read(config_file)
+        path = Path(config.get("recording", "pending_uploads_csv", fallback="./pending_uploads.csv"))
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return sum(1 for line in f if line.strip()) > 1  # header + at least one row
+        except OSError:
+            return False
+
+    def upload_deferred(self):
+        """Upload clips held by -v2 (e.g. left over from a session that was stopped early)."""
+        try:
+            return self.cloud_uploader.upload_deferred()
+        finally:
+            self.cloud_uploader.cleanup()
+
+    def cleanup(self, upload_deferred=False):
+        """Cleanup resources and wait for uploads to finish.
+
+        upload_deferred: after the camera is released, upload the clips held by -v2.
+        """
         try:
             # Cleanup camera
             if self.camera_recorder is not None:
                 self.camera_recorder.cleanup()
+            if upload_deferred:
+                self.cloud_uploader.upload_deferred()
             # Cleanup uploads
             self.cloud_uploader.cleanup()
         except Exception as e:

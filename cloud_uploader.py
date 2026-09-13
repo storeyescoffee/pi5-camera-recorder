@@ -841,10 +841,30 @@ class CloudUploader:
                 with self._inflight_lock:
                     self._inflight.discard(local_path)
 
-    def retry_pending_uploads(self):
+    def defer_upload(self, local_path, s3_key, filename, start_time=None):
+        """-v2: park a finished clip in pending instead of uploading it during recording.
+
+        The pending row keeps the file safe from startup cleanup; upload_deferred() sends it
+        after business hours. start_time is re-derived from the file mtime at upload time.
+        """
+        self._add_pending_upload(local_path, s3_key, filename)
+        self.logger.info(f"[DEFER] Holding upload until end of business hours: {filename}")
+
+    def upload_deferred(self):
+        """Upload every clip parked by defer_upload() (plus any ordinary pending retries) and wait."""
+        self.logger.info("[DEFER] Uploading clips held during business hours...")
+        count = self.retry_pending_uploads(deferred_as_normal=True, wait_timeout=None)
+        self.logger.info(f"[DEFER] Done. Uploaded {count} held clip(s).")
+        return count
+
+    def retry_pending_uploads(self, deferred_as_normal=False, wait_timeout=600):
         """Retry all uploads listed in pending_uploads.csv. Removes entries for missing files.
         Clips that already failed max_pending_retries times are moved to the dead-letter store.
-        Uses UPLOADING_FALLBACK then COMPLETED_FALLBACK when retrying."""
+        Uses UPLOADING_FALLBACK then COMPLETED_FALLBACK when retrying.
+
+        deferred_as_normal: rows never attempted (no video_code, attempts=0), i.e. held by -v2,
+        go through the normal UPLOADING/COMPLETED flow instead of the fallback statuses.
+        wait_timeout: seconds to wait for queued uploads (None = until all finish)."""
         # Serialize retry passes — startup, the periodic loop, and the rebounce coordinator can
         # all call this; overlapping passes would double-queue the same rows.
         if not self._retry_lock.acquire(blocking=False):
@@ -887,10 +907,11 @@ class CloudUploader:
                     self._remove_pending_upload(local_path)
                     continue
                 vc = (row.get("video_code") or "").strip() or None
-                self.upload_file(local_path, s3_key, filename, is_fallback=True, video_code=vc, pending_attempts=attempts)
+                is_fallback = not (deferred_as_normal and vc is None and attempts == 0)
+                self.upload_file(local_path, s3_key, filename, is_fallback=is_fallback, video_code=vc, pending_attempts=attempts)
                 count += 1
             if count > 0:
-                self.wait_for_uploads(timeout=600)
+                self.wait_for_uploads(timeout=wait_timeout)
             return count
         finally:
             self._retry_lock.release()
