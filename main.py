@@ -141,6 +141,23 @@ def _raise_open_files_limit():
         pass
 
 
+def _acquire_instance_lock(lock_path):
+    """Take an exclusive non-blocking flock on lock_path. Returns the open file (keep it
+    open for the process lifetime) or None if another process holds it. The kernel drops
+    the lock when the holder exits, including on SIGKILL from stop.sh, so it never goes stale."""
+    try:
+        import fcntl
+    except ImportError:  # non-Linux dev machine
+        return open(lock_path, "a")
+    f = open(lock_path, "a")
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        f.close()
+        return None
+    return f
+
+
 def main():
     _raise_open_files_limit()
     import argparse
@@ -200,6 +217,17 @@ def main():
             print(f"Recording until end-time ({remaining}s remaining)")
 
     pid_file = Path(__file__).resolve().parent / ".pid"
+    # Only one recorder may own the camera. A second instance (at job, @reboot cron, start.sh,
+    # manual run) would fail to open it, disrupt the running pipeline, and overwrite .pid so
+    # stop.sh kills the wrong process.
+    instance_lock = _acquire_instance_lock(pid_file.with_name(".lock"))
+    if instance_lock is None:
+        try:
+            running = pid_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            running = "?"
+        print(f"Another recorder is already running (pid {running}); exiting")
+        return 0
     try:
         pid_file.write_text(str(os.getpid()), encoding="utf-8")
         try:
@@ -225,6 +253,7 @@ def main():
             pid_file.unlink(missing_ok=True)
         except OSError:
             pass
+        instance_lock.close()
 
 
 if __name__ == "__main__":
