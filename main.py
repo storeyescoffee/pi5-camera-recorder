@@ -13,7 +13,6 @@ from pathlib import Path
 
 from api_client import create_api_client
 from schedule import (
-    _clear_at_queue,
     is_within_business_hours,
     resolve_business_hours,
     schedule_at,
@@ -216,6 +215,7 @@ def main():
     # on S3 init and a pending-upload retry pass, which we must not pay just to find out
     # we are outside the window. --single keeps its old unconditional behavior.
     deadline_ts = None
+    session_start = None
     if not args.single:
         gate_config = configparser.ConfigParser()
         gate_config.read(args.config)
@@ -235,9 +235,7 @@ def main():
             if remaining <= 0:
                 print("End-time already reached; nothing to record")
                 return 0
-            # Drop a stale queue-'a' job left over from before a reboot, so it cannot
-            # start a second recorder that fights this one for the camera.
-            _clear_at_queue("a")
+            session_start = start
             deadline_ts = time.time() + remaining
             print(f"Recording until end-time ({remaining}s remaining)")
 
@@ -260,6 +258,13 @@ def main():
         return 0
     try:
         pid_file.write_text(str(os.getpid()), encoding="utf-8")
+        if session_start is not None:
+            # Queue the next session now, not at end-time: a session ending normally used to exit
+            # with nothing scheduled, and a crash or reboot mid-session must not lose it either.
+            # schedule_at() first drops any stale queue-'a' job (e.g. left from before a reboot).
+            # Done after taking the lock so a rejected second instance can't replace the job.
+            schedule_at(session_start[0], session_start[1], Path(__file__).resolve(),
+                        extra_args=["-v2"] if args.defer_uploads else None)
         try:
             recorder = VideoRecorder(args.config, imx500_overlay=args.imx500, defer_uploads=args.defer_uploads)
 

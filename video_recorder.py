@@ -277,8 +277,9 @@ class VideoRecorder:
                             self.logger.error("Too many consecutive recording errors. Waiting before retry...")
                             time.sleep(30)
                             consecutive_errors = 0
-                            # Try to reinitialize camera
-                            self.camera_recorder._reinit_camera()
+                            # Reopen the camera (_setup_camera closes the old instance first);
+                            # _reinit_camera() is a no-op while a stalled instance still exists
+                            self.camera_recorder._setup_camera(max_retries=3, retry_delay=5)
 
                 except KeyboardInterrupt:
                     self.logger.info("Stopped by user (KeyboardInterrupt).")
@@ -292,7 +293,7 @@ class VideoRecorder:
                         time.sleep(60)
                         consecutive_errors = 0
                         # Try to reinitialize everything
-                        self.camera_recorder._reinit_camera()
+                        self.camera_recorder._setup_camera(max_retries=3, retry_delay=5)
                         self.cloud_uploader._reinit_s3_client()
                     else:
                         time.sleep(error_backoff)

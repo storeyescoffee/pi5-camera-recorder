@@ -168,6 +168,8 @@ class CameraRecorder:
         self._imx500_last_results = []
         self._recording_count = 0  # For periodic camera reinitialization
         self._pending_camera_reinit = False  # Set by reload_settings(); reinit before next recording
+        self._stall_reset_pending = False  # Set when frames stopped; reopen the camera before next recording
+        self._consecutive_stalls = 0
         self._datetime_overlay_font = None
         self._datetime_overlay_last_text = None
         self._datetime_overlay_bright_mask = None
@@ -239,6 +241,11 @@ class CameraRecorder:
             self.pending_uploads_csv = self.config.get("recording", "pending_uploads_csv", fallback="./pending_uploads.csv")
             self.post_stop_delay_seconds = float(self.config.get("recording", "post_stop_delay_seconds", fallback="1.5"))
             self.periodic_camera_reinit_recordings = int(self.config.get("recording", "periodic_camera_reinit_recordings", fallback="0"))
+            # Stall watchdog: end the segment when no frame arrives for this long (0 = off), reopen
+            # the camera, and reboot after this many stalls in a row (0 = never), at most once per interval.
+            self.frame_stall_timeout_seconds = max(0.0, float(self.config.get("recording", "frame_stall_timeout_seconds", fallback="5")))
+            self.stall_reboot_after = max(0, int(self.config.get("recording", "stall_reboot_after", fallback="3")))
+            self.stall_reboot_min_interval_minutes = max(0.0, float(self.config.get("recording", "stall_reboot_min_interval_minutes", fallback="60")))
             self.ffmpeg_video_thread_queue_size = int(self.config.get("recording", "ffmpeg_video_thread_queue_size", fallback="512"))
             # MP4 muxer: auto (pyav if available, else ffmpeg) | pyav | ffmpeg
             self.output_muxer = (self.config.get("recording", "output_muxer", fallback="auto") or "auto").strip().lower()
@@ -797,6 +804,64 @@ class CameraRecorder:
         else:
             self.logger.info(msg)
 
+    def _wait_for_segment(self, duration_seconds):
+        """Sleep through one segment while watching the frame counter.
+
+        Returns True (stalled) as soon as no frame has reached _frame_callback for
+        frame_stall_timeout_seconds, so a dead pipeline costs seconds instead of a whole segment.
+        """
+        timeout = self.frame_stall_timeout_seconds
+        end = time.monotonic() + duration_seconds
+        last_frames = self._stats_frames
+        last_progress = time.monotonic()
+        while True:
+            remaining = end - time.monotonic()
+            if remaining <= 0:
+                return False
+            time.sleep(min(1.0, remaining))
+            if timeout <= 0:
+                continue
+            frames = self._stats_frames
+            if frames != last_frames:
+                last_frames = frames
+                last_progress = time.monotonic()
+            elif time.monotonic() - last_progress >= timeout:
+                return True
+
+    def _on_stall(self, capture_seconds):
+        """Frames stopped: schedule a camera reopen, and reboot if reopening keeps failing."""
+        self._consecutive_stalls += 1
+        self.logger.error(
+            f"[STALL] No frames for {self.frame_stall_timeout_seconds:.0f}s "
+            f"({self._stats_frames} frames in {capture_seconds:.1f}s); "
+            f"stall {self._consecutive_stalls} in a row, camera will be reopened. {self._system_health()}"
+        )
+        self._stall_reset_pending = True
+        if self.stall_reboot_after > 0 and self._consecutive_stalls >= self.stall_reboot_after:
+            self._reboot_after_stalls()
+
+    def _reboot_after_stalls(self):
+        """Last resort: unicam can stay wedged until the Pi reboots. A stamp file rate-limits this,
+        so a camera that is really broken (cable, sensor) cannot put the Pi into a reboot loop."""
+        stamp = Path(__file__).resolve().parent / ".last_stall_reboot"
+        min_interval = self.stall_reboot_min_interval_minutes * 60
+        try:
+            since = time.time() - stamp.stat().st_mtime
+        except OSError:
+            since = None
+        if since is not None and since < min_interval:
+            self.logger.error(
+                f"[STALL] Camera still stalled, but the last stall reboot was {since / 60:.0f} min ago "
+                f"(limit: one per {self.stall_reboot_min_interval_minutes:.0f} min); not rebooting"
+            )
+            return
+        self.logger.critical(f"[STALL] {self._consecutive_stalls} stalls in a row; rebooting the Pi")
+        try:
+            stamp.touch()
+            subprocess.run(["sudo", "-n", "reboot"], capture_output=True, timeout=30, check=True)
+        except (OSError, subprocess.SubprocessError) as e:
+            self.logger.error(f"[STALL] Reboot failed (needs passwordless sudo): {e}")
+
     def _setup_camera(self, max_retries=5, retry_delay=5):
         """Configure PiCamera2 with retry logic; or rpicam-vid-only mode (no Python camera)."""
         if self.use_rpicam_vid:
@@ -1054,22 +1119,22 @@ class CameraRecorder:
 
     def _safe_stop_recording(self):
         """
-        Stop recording with defensive error handling, then wait for buffers to release.
-        Call this instead of camera.stop_recording() directly.
+        Stop the segment's encoder with defensive error handling. The camera keeps streaming
+        (see _safe_start_recording), so there are no pipeline buffers to wait for.
         """
         if self.camera is None:
             return
         try:
-            self.camera.stop_recording()
+            self.camera.stop_encoder()
         except Exception as e:
-            self.logger.warning(f"[RECORD] Error during stop_recording: {e}")
-        finally:
-            delay = getattr(self, "post_stop_delay_seconds", 1.5)
-            time.sleep(delay)
+            self.logger.warning(f"[RECORD] Error during stop_encoder: {e}")
 
     def _safe_start_recording(self, enc, out, local_path):
         """
-        Safe wrapper for start_recording. Handles Broken pipe and encoder state issues.
+        Start one segment's encoder on the already-streaming camera. Only the encoder is swapped
+        per segment: stopping/starting the camera each time left a ~1.7s gap between clips, and on
+        Pi 4 unicam eventually refused the restart ("Failed to start media pipeline: -22") while
+        picamera2 raised nothing, so every later segment recorded zero frames.
         On failure: performs full camera reset, reinitializes camera, returns False.
         Caller MUST create a NEW encoder before retry - never reuse a failed encoder.
 
@@ -1082,7 +1147,9 @@ class CameraRecorder:
             bool: True if recording started successfully, False otherwise
         """
         try:
-            self.camera.start_recording(enc, out)
+            self.camera.start_encoder(enc, out)
+            if not getattr(self.camera, "started", True):
+                self.camera.start()
             return True
         except RuntimeError as e:
             err_str = str(e).lower()
@@ -1096,7 +1163,7 @@ class CameraRecorder:
         except Exception as e:
             self.logger.error(f"[RECORD] Unexpected error during start_recording: {e}", exc_info=True)
             try:
-                self.camera.stop_recording()
+                self.camera.stop_encoder()
             except Exception:
                 pass
             self._full_camera_reset()
@@ -1201,6 +1268,14 @@ class CameraRecorder:
                     self.logger.error("[RECORD] Cannot record: camera unavailable")
                     return False, None, None, None
 
+        # Frames stopped in the previous segment: reopen the camera so the whole pipeline is rebuilt.
+        if self._stall_reset_pending and not self.use_rpicam_vid:
+            self._stall_reset_pending = False
+            self._pending_camera_reinit = False  # the reopen below applies synced settings too
+            self.logger.info("[STALL] Reopening camera after a stall...")
+            if not self._setup_camera(max_retries=3, retry_delay=5):
+                return False, None, None, None
+
         # Reinit camera if settings were synced (shutter, gain, flip need hardware reconfig)
         if self._pending_camera_reinit:
             if self.use_rpicam_vid:
@@ -1296,15 +1371,19 @@ class CameraRecorder:
 
             # Record for the specified duration
             try:
-                time.sleep(duration_seconds)
+                stalled = self._wait_for_segment(duration_seconds)
             except KeyboardInterrupt:
+                self._safe_stop_recording()
                 self.logger.info("[RECORD] Recording interrupted by user")
                 raise
 
             capture_seconds = time.time() - capture_start
-            # Safe stop with buffer release delay
             self._safe_stop_recording()
             self._log_frame_stats(capture_seconds)
+            if stalled:
+                self._on_stall(capture_seconds)
+            else:
+                self._consecutive_stalls = 0
             actual_duration = time.time() - recording_start_time
             self.logger.info(f"[RECORD] Native recording completed: {filename}")
             self.logger.info(f"[RECORD] Target duration: {duration_seconds}s, Actual duration: {actual_duration:.1f}s")
