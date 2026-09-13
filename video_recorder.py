@@ -1,4 +1,4 @@
-"""Main orchestrator: store settings, camera recording, cloud upload, MQTT sync."""
+"""Main orchestrator: store settings, camera recording, cloud upload."""
 
 import json
 import time
@@ -11,21 +11,8 @@ from logging.handlers import RotatingFileHandler
 from camera_recorder import CameraRecorder
 from cloud_uploader import CloudUploader
 from api_client import create_api_client
-from mqtt_client import MqttSyncClient
 
 CACHE_SETTINGS_PATH = Path("cache/settings.json")
-
-
-def _get_pi_serial_id():
-    """Read Raspberry Pi serial ID from /proc/cpuinfo."""
-    try:
-        with open("/proc/cpuinfo", "r", encoding="utf-8") as f:
-            for line in f:
-                if line.startswith("Serial"):
-                    return line.split(":", 1)[1].strip()
-    except (OSError, IndexError):
-        pass
-    return ""
 
 
 class VideoRecorder:
@@ -35,7 +22,7 @@ class VideoRecorder:
         self.config = configparser.ConfigParser()
         self.config.read(config_file)
         self.imx500_overlay = bool(imx500_overlay)
-        # upload_only: skip camera + MQTT + startup auto-retry (used by --reconcile).
+        # upload_only: skip camera + startup auto-retry (used by --reconcile).
         self.upload_only = bool(upload_only)
 
         # Setup logging with file handler
@@ -47,9 +34,8 @@ class VideoRecorder:
         # Initialize cloud uploader first (before camera) for pending retry
         self.cloud_uploader = CloudUploader(self.config, self.logger)
 
-        self.mqtt_client = None
         if self.upload_only:
-            # Reconcile mode: no camera, no MQTT, no automatic retry — reconcile() drives uploads.
+            # Reconcile mode: no camera, no automatic retry — reconcile() drives uploads.
             self.camera_recorder = None
             return
 
@@ -57,9 +43,6 @@ class VideoRecorder:
 
         # Initialize camera recorder (cleanup will skip pending upload files)
         self.camera_recorder = CameraRecorder(self.config, self.logger, imx500_overlay=self.imx500_overlay)
-
-        # Start MQTT sync-settings listener if BROKER and device_id available
-        self._start_mqtt_sync()
 
     def reconcile(self):
         """Upload all clips still saved on the SD card (pending + dead-letter), then return the count."""
@@ -190,127 +173,6 @@ class VideoRecorder:
         except Exception as e:
             self.logger.warning(f"[STORE] Failed to apply settings: {e}", exc_info=True)
 
-    def _on_sync_settings(self, payload=None):
-        """Called when MQTT sync-settings message received.
-        If payload is JSON with name and value: apply single setting (optimized).
-        Else: full sync from API."""
-        if payload:
-            try:
-                data = json.loads(payload) if isinstance(payload, str) else payload
-                name = data.get("name")
-                value = data.get("value")
-                if name is not None and value is not None:
-                    self._apply_single_setting(str(name), value)
-                    return
-            except (json.JSONDecodeError, TypeError, AttributeError):
-                pass
-        # Fallback: full sync
-        self.logger.info("[STORE] Sync-settings triggered, full sync from API...")
-        self._apply_store_settings()
-        self.camera_recorder.reload_settings(force_camera_reinit=True)
-        self.cloud_uploader.reload_settings()
-
-    # Setting name -> (config section, config key, value transform, camera_reinit, cloud_reload)
-    _SETTING_ACTIONS = {
-        # Camera hardware - need reinit
-        "shutter-speed": ("camera", "shutter_speed", lambda v: str(v), True, False),
-        "analog-gain": ("camera", "analog_gain", lambda v: str(v), True, False),
-        "flip": ("camera", "reverse_camera", lambda v: str(str(v).lower() in ("true", "1", "yes")), True, False),
-        # Camera/encoder - no reinit, applies on next recording
-        "bitrate": ("camera", "bitrate", lambda v: str(v), False, False),
-        # Recording - applies on next recording
-        "chunk-duration": ("recording", "duration_minutes", lambda v: str(v), False, False),
-        "s3-location": ("gcs", "bucket_location", lambda v: str(v).strip()[5:] if str(v).strip().startswith("s3://") else str(v), False, True),
-        # Register
-        "delta-time": ("register", "delta_time", lambda v: str(v), False, False),
-        # Business hours - the session window is fixed at startup, so these take effect next session
-        "start-time": ("business_hour", "start_time", lambda v: str(v).strip(), False, False),
-        "end-time": ("business_hour", "end_time", lambda v: str(v).strip(), False, False),
-    }
-
-    def _apply_single_setting(self, name, value):
-        """Apply a single setting by name and value. Uses targeted action per setting."""
-        action = self._SETTING_ACTIONS.get(name)
-        if not action:
-            self.logger.warning(f"[STORE] Unknown setting name: {name}")
-            return
-        section, key, transform, camera_reinit, cloud_reload = action
-        try:
-            config_value = transform(value)
-            if not self.config.has_section(section):
-                self.config.add_section(section)
-            self.config.set(section, key, config_value)
-            self.logger.info(f"[STORE] Applied {name}={config_value}")
-            if section == "business_hour":
-                self.logger.info("[STORE] Business-hour change takes effect at the next session, not the current one")
-        except Exception as e:
-            self.logger.warning(f"[STORE] Failed to apply {name}: {e}")
-            return
-        # Update cache so it reflects the new value (for restart fallback)
-        self._update_cache_single(name, value)
-        self.camera_recorder.reload_settings(force_camera_reinit=camera_reinit)
-        if cloud_reload:
-            self.cloud_uploader.reload_settings()
-
-    def _update_cache_single(self, name, value):
-        """Merge single setting into cache/settings.json."""
-        name_to_api = {"shutter-speed": ("CAMERA", "shutter-speed"), "analog-gain": ("CAMERA", "analog-gain"),
-                      "flip": ("CAMERA", "flip"), "bitrate": ("CAMERA", "bitrate"),
-                      "chunk-duration": ("RECORDING", "chunk-duration"), "s3-location": ("RECORDING", "s3-location"),
-                      "delta-time": ("REGISTER", "delta-time"),
-                      "start-time": ("BUSINESS_HOUR", "start-time"),
-                      "end-time": ("BUSINESS_HOUR", "end-time")}
-        path = name_to_api.get(name)
-        if not path or not CACHE_SETTINGS_PATH.exists():
-            return
-        try:
-            with open(CACHE_SETTINGS_PATH, "r", encoding="utf-8") as f:
-                cache = json.load(f)
-            api_section, api_key = path
-            if api_section not in cache:
-                cache[api_section] = {}
-            cache[api_section][api_key] = str(value)
-            with open(CACHE_SETTINGS_PATH, "w", encoding="utf-8") as f:
-                json.dump(cache, f, indent=2)
-        except Exception as e:
-            self.logger.debug(f"[STORE] Could not update cache: {e}")
-
-    def _start_mqtt_sync(self):
-        """Start MQTT client to subscribe to sync-settings if BROKER and device_id available."""
-        device_id = self.config.get("api", "device_id", fallback="").strip() if self.config.has_section("api") else ""
-        if not device_id:
-            device_id = _get_pi_serial_id()
-        if not device_id:
-            return
-        broker = {}
-        if CACHE_SETTINGS_PATH.exists():
-            try:
-                with open(CACHE_SETTINGS_PATH, "r", encoding="utf-8") as f:
-                    settings = json.load(f)
-                broker = settings.get("BROKER", {})
-            except Exception as e:
-                self.logger.warning(f"[MQTT] Could not read broker from cache: {e}")
-        host = broker.get("host", "").strip()
-        port = broker.get("port", "1883")
-        username = broker.get("username", "").strip()
-        password = broker.get("password", "").strip()
-        if not host or not username:
-            self.logger.info("[MQTT] BROKER not in store settings, sync-settings disabled")
-            return
-        self.mqtt_client = MqttSyncClient(
-            host=host,
-            port=port,
-            username=username,
-            password=password,
-            device_id=device_id,
-            on_sync_callback=self._on_sync_settings,
-            logger=self.logger,
-        )
-        if self.mqtt_client.start():
-            self.logger.info("[MQTT] Sync-settings listener started")
-        else:
-            self.mqtt_client = None
-
     def record_single_video(self):
         """Record a single video."""
         try:
@@ -436,9 +298,6 @@ class VideoRecorder:
     def cleanup(self):
         """Cleanup resources and wait for uploads to finish."""
         try:
-            if self.mqtt_client:
-                self.mqtt_client.stop()
-                self.mqtt_client = None
             # Cleanup camera
             if self.camera_recorder is not None:
                 self.camera_recorder.cleanup()

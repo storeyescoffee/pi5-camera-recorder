@@ -394,7 +394,7 @@ class CameraRecorder:
         return FfmpegOutputLargeQueue(local_path, video_thread_queue_size=queue_size)
 
     def reload_settings(self, force_camera_reinit=True):
-        """Reload configuration from config (e.g. after sync-settings MQTT message).
+        """Reload configuration from config (e.g. after a live settings change).
         If force_camera_reinit, marks camera for reinit so hardware settings (shutter, gain, flip)
         apply on next recording. Otherwise only in-memory config is updated."""
         self._load_config()

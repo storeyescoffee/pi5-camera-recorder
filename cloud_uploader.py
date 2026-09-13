@@ -253,7 +253,7 @@ class CloudUploader:
         self._upload_busy = threading.Semaphore(n)
 
     def reload_settings(self):
-        """Reload configuration from config (e.g. after sync-settings MQTT message)."""
+        """Reload configuration from config (e.g. after a live settings change)."""
         self._load_config()
         self._build_transfer_config()
         with self.upload_lock:
