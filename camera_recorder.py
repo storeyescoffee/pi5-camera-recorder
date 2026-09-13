@@ -45,6 +45,47 @@ except ImportError:
     _PIL_AVAILABLE = False
 
 
+_TUNED_V4L2_H264_ENCODER = None
+
+
+def _tuned_v4l2_h264_encoder_class():
+    """picamera2's V4L2 H264Encoder, plus extra V4L2 controls (e.g. bitrate mode) it doesn't expose.
+
+    H264Encoder._start() rebuilds self._controls and then calls super()._start(), which applies
+    them. The mixin sits between the two in the MRO, so it appends extra_v4l2_controls at the
+    point they are applied. Built lazily: the V4L2 encoder modules only matter on Pi 4.
+    """
+    global _TUNED_V4L2_H264_ENCODER
+    if _TUNED_V4L2_H264_ENCODER is None:
+        from picamera2.encoders.h264_encoder import H264Encoder as V4L2H264Encoder
+        from picamera2.encoders.v4l2_encoder import V4L2Encoder
+
+        class _ExtraV4L2Controls(V4L2Encoder):
+            extra_v4l2_controls = ()
+
+            def _start(self):
+                self._controls = list(self._controls) + list(self.extra_v4l2_controls)
+                super()._start()
+
+        class TunedV4L2H264Encoder(V4L2H264Encoder, _ExtraV4L2Controls):
+            pass
+
+        _TUNED_V4L2_H264_ENCODER = TunedV4L2H264Encoder
+    return _TUNED_V4L2_H264_ENCODER
+
+
+def _hw_bitrate_mode_controls(mode):
+    """V4L2 control list selecting VBR/CBR rate control on the Pi 4 hardware encoder."""
+    try:
+        import videodev2
+        cid = videodev2.V4L2_CID_MPEG_VIDEO_BITRATE_MODE
+        vbr = videodev2.V4L2_MPEG_VIDEO_BITRATE_MODE_VBR
+        cbr = videodev2.V4L2_MPEG_VIDEO_BITRATE_MODE_CBR
+    except (ImportError, AttributeError):
+        cid, vbr, cbr = 0x009909CE, 0, 1  # V4L2_CID_CODEC_BASE + 206; enum from videodev2.h
+    return [(cid, cbr if mode == "cbr" else vbr)]
+
+
 class FfmpegOutputLargeQueue(FfmpegOutput):
     """
     FfmpegOutput with raised thread_queue_size to avoid
@@ -133,6 +174,7 @@ class CameraRecorder:
         self._datetime_overlay_shadow_mask = None
 
         self._load_config()
+        self._reset_frame_stats()
         # Resolved per camera setup by _select_encoder_backend().
         self.use_hw_encoder = False
         self.capture_size = (self.resolution_width, self.resolution_height)
@@ -182,6 +224,13 @@ class CameraRecorder:
             if self.encoder_mode not in ("auto", "hardware", "software"):
                 self.logger.warning(f"[CONFIG] Unknown camera.encoder '{self.encoder_mode}', using 'auto'")
                 self.encoder_mode = "auto"
+            # Pi 4 hardware encoder rate control: vbr (bitrate is a ceiling) | cbr (always spend bitrate)
+            self.hw_bitrate_mode = (self.config.get("camera", "hw_bitrate_mode", fallback="vbr") or "vbr").strip().lower()
+            if self.hw_bitrate_mode not in ("vbr", "cbr"):
+                self.logger.warning(f"[CONFIG] Unknown camera.hw_bitrate_mode '{self.hw_bitrate_mode}', using 'vbr'")
+                self.hw_bitrate_mode = "vbr"
+            # Camera buffers: headroom so short CPU stalls delay frames instead of dropping them.
+            self.buffer_count = max(4, int(self.config.get("camera", "buffer_count", fallback="8")))
 
             # Recording settings (from store settings API/cache only)
             self.recording_duration = int(self.config.get("recording", "duration_minutes"))
@@ -303,12 +352,14 @@ class CameraRecorder:
         self.use_hw_encoder = use_hw
         self.capture_size = (w, h)
         backend = "V4L2 hardware H.264" if use_hw else "Libav software H.264"
+        if use_hw:
+            backend += f" ({self.hw_bitrate_mode.upper()})"
         self.logger.info(f"[ENCODER] Platform {platform_name}, encoder={self.encoder_mode} -> {backend}")
 
     def _create_encoder(self):
         """Create a fresh H.264 encoder for the selected backend (never reuse one across recordings)."""
         if self.use_hw_encoder:
-            from picamera2.encoders.h264_encoder import H264Encoder as V4L2H264Encoder
+            encoder_cls = _tuned_v4l2_h264_encoder_class()
             bitrate = self.bitrate
             if bitrate > self.HW_H264_MAX_BITRATE:
                 self.logger.warning(
@@ -316,10 +367,14 @@ class CameraRecorder:
                 )
                 bitrate = self.HW_H264_MAX_BITRATE
             try:
-                return V4L2H264Encoder(bitrate=bitrate, repeat=True, iperiod=self.fps, framerate=self.fps)
+                # enable_sps_framerate writes fps into the SPS so players report the right rate.
+                enc = encoder_cls(bitrate=bitrate, repeat=True, iperiod=self.fps,
+                                  framerate=self.fps, enable_sps_framerate=True)
             except TypeError:
-                # Older picamera2 V4L2 encoder has no framerate kwarg.
-                return V4L2H264Encoder(bitrate=bitrate, repeat=True, iperiod=self.fps)
+                # Older picamera2 V4L2 encoder has no framerate/enable_sps_framerate kwargs.
+                enc = encoder_cls(bitrate=bitrate, repeat=True, iperiod=self.fps)
+            enc.extra_v4l2_controls = _hw_bitrate_mode_controls(self.hw_bitrate_mode)
+            return enc
         # Libav defaults framerate=30; must match self.fps for correct timing/bitrate.
         return LibavH264Encoder(bitrate=self.bitrate, framerate=self.fps, iperiod=self.fps, repeat=True)
 
@@ -670,6 +725,78 @@ class CameraRecorder:
             region[shadow_mask[:rh, :rw]] = 16
             region[bright_mask[:rh, :rw]] = 235
 
+    def _reset_frame_stats(self):
+        self._stats_frames = 0
+        self._stats_dropped = 0
+        self._stats_last_ts_ns = None
+        self._stats_frame_duration_us = None
+        self._stats_exposure_us = None
+
+    def _frame_callback(self, request):
+        """picam2.pre_callback: per-segment frame stats, then the optional datetime overlay.
+
+        Counts frames that reached Python and gaps in SensorTimestamp (frames the pipeline dropped),
+        and samples FrameDuration/ExposureTime to tell a slow sensor from a starved pipeline.
+        """
+        try:
+            self._stats_frames += 1
+            ts_ns = request.request.metadata[libcamera.controls.SensorTimestamp]
+            last = self._stats_last_ts_ns
+            if last is not None:
+                expected_ns = 1_000_000_000 / self.fps
+                gap = (ts_ns - last) / expected_ns
+                if gap > 1.5:
+                    self._stats_dropped += int(round(gap)) - 1
+            self._stats_last_ts_ns = ts_ns
+            if self._stats_frames % (self.fps * 5) == 1:
+                md = request.get_metadata()
+                self._stats_frame_duration_us = md.get("FrameDuration")
+                self._stats_exposure_us = md.get("ExposureTime")
+        except Exception:
+            pass
+        if self.datetime_overlay:
+            self.datetime_overlay_callback(request)
+
+    @staticmethod
+    def _system_health():
+        """CPU temperature, throttle flags and load, for correlating frame drops."""
+        parts = []
+        try:
+            with open("/sys/class/thermal/thermal_zone0/temp", encoding="utf-8") as f:
+                parts.append(f"temp={int(f.read().strip()) / 1000:.1f}C")
+        except (OSError, ValueError):
+            pass
+        try:
+            out = subprocess.run(["vcgencmd", "get_throttled"], capture_output=True, text=True, timeout=2)
+            if out.returncode == 0:
+                parts.append(out.stdout.strip())  # throttled=0x0 is healthy
+        except (OSError, subprocess.SubprocessError):
+            pass
+        try:
+            parts.append("load=%.2f/%.2f/%.2f" % os.getloadavg())
+        except (OSError, AttributeError):
+            pass
+        return ", ".join(parts) or "n/a"
+
+    def _log_frame_stats(self, duration_s):
+        frames = getattr(self, "_stats_frames", 0)
+        if not frames or duration_s <= 0:
+            return
+        fps = frames / duration_s
+        fd = self._stats_frame_duration_us
+        exp = self._stats_exposure_us
+        msg = (
+            f"[STATS] {frames} frames in {duration_s:.1f}s = {fps:.1f}fps (target {self.fps}), "
+            f"dropped~{self._stats_dropped}, FrameDuration={fd}us, ExposureTime={exp}us, "
+            f"{self._system_health()}"
+        )
+        if fps < self.fps * 0.9:
+            # FrameDuration ~= 1e6/fps means the sensor is fine and frames were lost downstream (CPU/
+            # thermal); a larger FrameDuration means the sensor itself slowed (exposure/light).
+            self.logger.warning(msg + " — below target")
+        else:
+            self.logger.info(msg)
+
     def _setup_camera(self, max_retries=5, retry_delay=5):
         """Configure PiCamera2 with retry logic; or rpicam-vid-only mode (no Python camera)."""
         if self.use_rpicam_vid:
@@ -731,7 +858,10 @@ class CameraRecorder:
                 else:
                     self.camera = self._open_picamera2()
                 frame_duration_us = int(1_000_000 / self.fps)
-                
+                # queue=False: don't hold the newest frame back for capture_array() (unused here),
+                # leaving every buffer free for the encoder path.
+                video_config_extras = {"buffer_count": self.buffer_count, "queue": False}
+
                 # Check if color format is forced in config
                 if self.force_color_format:
                     self.logger.info(f"Forcing color format to: {self.force_color_format}")
@@ -743,7 +873,8 @@ class CameraRecorder:
                                 "AnalogueGain": self.analog_gain,
                                 "FrameDurationLimits": (frame_duration_us, frame_duration_us),
                             },
-                            transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform()
+                            transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform(),
+                            **video_config_extras
                         )
                         self.camera.configure(video_config)
                         self.use_bgr_format = (self.force_color_format == "BGR888")
@@ -768,7 +899,8 @@ class CameraRecorder:
                                     "AeEnable": True,
                                     "AeFlickerPeriod": 10000
                                 },
-                                transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform()
+                                transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform(),
+                                **video_config_extras
                             )
                             self.camera.configure(video_config)
                             self.use_bgr_format = False
@@ -791,7 +923,8 @@ class CameraRecorder:
                                     "AeEnable": True,
                                     "AeFlickerPeriod": 10000
                                 },
-                                transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform()
+                                transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform(),
+                                **video_config_extras
                             )
                             self.camera.configure(video_config)
                             self.use_bgr_format = True
@@ -808,7 +941,8 @@ class CameraRecorder:
                                     "AnalogueGain": self.analog_gain,
                                     "FrameDurationLimits": (frame_duration_us, frame_duration_us),
                                 },
-                                transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform()
+                                transform=libcamera.Transform(hflip=True, vflip=True) if self.reverse_camera else libcamera.Transform(),
+                                **video_config_extras
                             )
                             self.camera.configure(video_config)
                             self.use_bgr_format = False
@@ -816,7 +950,7 @@ class CameraRecorder:
                             self.logger.info("Using RGB888 format - color conversion will be applied")
                 
                 # Optional per-frame overlays (run before encoding).
-                self.camera.pre_callback = self.datetime_overlay_callback if self.datetime_overlay else None
+                self.camera.pre_callback = self._frame_callback
                 self.camera.post_callback = self.imx500_overlay_callback if self.imx500_overlay else None
                 self.camera.start()
                 
@@ -1145,6 +1279,7 @@ class CameraRecorder:
             self.logger.info(f"[RECORD] MP4 muxer: {type(out).__name__}")
 
             recording_start_time = time.time()
+            self._reset_frame_stats()
 
             # Safe start: never reuse a failed encoder
             started = self._safe_start_recording(enc, out, local_path)
@@ -1156,6 +1291,8 @@ class CameraRecorder:
             if not started:
                 self.logger.error("[RECORD] Failed to start recording after retry")
                 return False, None, None, None
+            self._reset_frame_stats()
+            capture_start = time.time()
 
             # Record for the specified duration
             try:
@@ -1164,8 +1301,10 @@ class CameraRecorder:
                 self.logger.info("[RECORD] Recording interrupted by user")
                 raise
 
+            capture_seconds = time.time() - capture_start
             # Safe stop with buffer release delay
             self._safe_stop_recording()
+            self._log_frame_stats(capture_seconds)
             actual_duration = time.time() - recording_start_time
             self.logger.info(f"[RECORD] Native recording completed: {filename}")
             self.logger.info(f"[RECORD] Target duration: {duration_seconds}s, Actual duration: {actual_duration:.1f}s")

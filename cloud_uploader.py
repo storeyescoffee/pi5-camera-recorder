@@ -141,6 +141,9 @@ class CloudUploader:
             # which fight each other and get dropped. chunk size controls how much a dead part costs.
             self.s3_multipart_chunk_mb = max(5, int(self.config.get("recording", "s3_multipart_chunk_mb", fallback="8")))
             self.s3_upload_concurrency = max(1, int(self.config.get("recording", "s3_upload_concurrency", fallback="2")))
+            # Nice value for upload threads (0 = off). TLS on Pi 4 (no AES instructions) can saturate
+            # the CPU and starve the camera pipeline, which then drops frames.
+            self.upload_thread_nice = max(0, min(19, int(self.config.get("recording", "upload_thread_nice", fallback="10"))))
 
             # Network rebounce: auto-bounce the NetworkManager link when uploads fail on a dead link.
             self.network_rebounce_enabled = self.config.getboolean("recording", "network_rebounce_enabled", fallback=False)
@@ -214,6 +217,17 @@ class CloudUploader:
         self.s3_client = None
         self._boto_session = None
 
+    def _lower_thread_priority(self):
+        """Executor initializer: renice this worker thread. Linux nice is per-thread, and threads
+        boto3/s3transfer spawn from here inherit it, so the whole upload path yields to the camera."""
+        nice = getattr(self, "upload_thread_nice", 0)
+        if nice <= 0:
+            return
+        try:
+            os.setpriority(os.PRIO_PROCESS, threading.get_native_id(), nice)
+        except (AttributeError, OSError):
+            pass  # non-Linux or not permitted
+
     def _ensure_upload_executor_locked(self):
         """Rebuild ThreadPoolExecutor when max_concurrent_uploads changes (under caller coordination)."""
         n = max(1, int(self.max_concurrent_uploads))
@@ -226,6 +240,7 @@ class CloudUploader:
         self._upload_executor = ThreadPoolExecutor(
             max_workers=n,
             thread_name_prefix="s3-upload",
+            initializer=self._lower_thread_priority,
         )
         self.logger.info(f"[UPLOAD] Thread pool ready: max_workers={n}")
 
