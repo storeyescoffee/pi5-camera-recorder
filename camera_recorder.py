@@ -28,6 +28,12 @@ from picamera2.platform import Platform, get_platform
 import libcamera
 
 try:
+    # Muxes in-process using the camera's per-frame timestamps (picamera2 >= 0.3.23).
+    from picamera2.outputs import PyavOutput
+except ImportError:
+    PyavOutput = None
+
+try:
     from picamera2.encoders import LibavH264Encoder
 except ImportError:  # very old picamera2 (Pi 4 / Bullseye) without the Libav encoders
     LibavH264Encoder = None
@@ -185,6 +191,11 @@ class CameraRecorder:
             self.post_stop_delay_seconds = float(self.config.get("recording", "post_stop_delay_seconds", fallback="1.5"))
             self.periodic_camera_reinit_recordings = int(self.config.get("recording", "periodic_camera_reinit_recordings", fallback="0"))
             self.ffmpeg_video_thread_queue_size = int(self.config.get("recording", "ffmpeg_video_thread_queue_size", fallback="512"))
+            # MP4 muxer: auto (pyav if available, else ffmpeg) | pyav | ffmpeg
+            self.output_muxer = (self.config.get("recording", "output_muxer", fallback="auto") or "auto").strip().lower()
+            if self.output_muxer not in ("auto", "pyav", "ffmpeg"):
+                self.logger.warning(f"[CONFIG] Unknown recording.output_muxer '{self.output_muxer}', using 'auto'")
+                self.output_muxer = "auto"
             # Optional: use official rpicam-vid instead of PiCamera2 (frees Python from holding the camera; good on Pi 5)
             self.use_rpicam_vid = self.config.getboolean("recording", "use_rpicam_vid", fallback=False)
             self.rpicam_vid_path = (self.config.get("recording", "rpicam_vid_path", fallback="") or "rpicam-vid").strip()
@@ -311,6 +322,21 @@ class CameraRecorder:
                 return V4L2H264Encoder(bitrate=bitrate, repeat=True, iperiod=self.fps)
         # Libav defaults framerate=30; must match self.fps for correct timing/bitrate.
         return LibavH264Encoder(bitrate=self.bitrate, framerate=self.fps, iperiod=self.fps, repeat=True)
+
+    def _create_output(self, local_path):
+        """Create the MP4 output for one recording.
+
+        PyavOutput stamps packets with the camera's frame timestamps. FfmpegOutput stamps them
+        with wall-clock read time, which gives "Timestamps are unset" / "Non-monotonic DTS"
+        when frames arrive split across pipe reads, so it is only the fallback.
+        """
+        if self.output_muxer != "ffmpeg":
+            if PyavOutput is not None:
+                return PyavOutput(local_path)
+            if self.output_muxer == "pyav":
+                self.logger.warning("[RECORD] PyavOutput unavailable (picamera2 too old); falling back to ffmpeg")
+        queue_size = getattr(self, "ffmpeg_video_thread_queue_size", 512)
+        return FfmpegOutputLargeQueue(local_path, video_thread_queue_size=queue_size)
 
     def reload_settings(self, force_camera_reinit=True):
         """Reload configuration from config (e.g. after sync-settings MQTT message).
@@ -880,7 +906,7 @@ class CameraRecorder:
 
         Args:
             enc: H.264 encoder instance (from _create_encoder)
-            out: FfmpegOutput instance
+            out: Output instance (from _create_output)
             local_path: Output file path (for logging)
 
         Returns:
@@ -1080,8 +1106,8 @@ class CameraRecorder:
             )
 
             enc = self._create_encoder()
-            queue_size = getattr(self, "ffmpeg_video_thread_queue_size", 512)
-            out = FfmpegOutputLargeQueue(local_path, video_thread_queue_size=queue_size)
+            out = self._create_output(local_path)
+            self.logger.info(f"[RECORD] MP4 muxer: {type(out).__name__}")
 
             recording_start_time = time.time()
 
@@ -1090,7 +1116,7 @@ class CameraRecorder:
             if not started:
                 self.logger.info("[RECORD] Retrying with fresh encoder after full camera reset...")
                 enc = self._create_encoder()
-                out = FfmpegOutputLargeQueue(local_path, video_thread_queue_size=queue_size)
+                out = self._create_output(local_path)
                 started = self._safe_start_recording(enc, out, local_path)
             if not started:
                 self.logger.error("[RECORD] Failed to start recording after retry")
