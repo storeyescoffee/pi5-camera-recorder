@@ -158,7 +158,7 @@ def _acquire_instance_lock(lock_path):
 
 
 def _upload_held_clips(config_file):
-    """-v2 outside business hours: upload clips held by a session that was stopped before its
+    """Outside business hours: upload clips held by a session that was stopped before its
     end-time. Skipped if another recorder (e.g. a session still flushing) holds the lock."""
     lock_path = Path(__file__).resolve().parent / ".lock"
     lock = _acquire_instance_lock(lock_path)
@@ -189,8 +189,6 @@ def main():
     parser.add_argument("--imx500", action="store_true", help="Overlay IMX500 bounding boxes on recorded frames (if metadata is present)")
     parser.add_argument("--ignore-hours", action="store_true",
                         help="Record at any hour, ignoring BUSINESS_HOUR and [business_hour] in config.conf")
-    parser.add_argument("-v2", "--defer-uploads", dest="defer_uploads", action="store_true",
-                        help="Hold all uploads until the business-hours end-time, then upload them before exiting")
     args = parser.parse_args()
 
     if args.test:
@@ -226,10 +224,10 @@ def main():
             now = datetime.now()
             if not is_within_business_hours(now, *start, *end):
                 print(f"Outside business hours, scheduling for start-time ({start[0]:02d}:{start[1]:02d})")
-                schedule_at(start[0], start[1], Path(__file__).resolve(),
-                            extra_args=["-v2"] if args.defer_uploads else None)
-                if args.defer_uploads:
-                    _upload_held_clips(args.config)
+                schedule_at(start[0], start[1], Path(__file__).resolve())
+                # The camera is idle until start-time, so this is the moment to send anything
+                # a session that was stopped before its end-time left behind.
+                _upload_held_clips(args.config)
                 return 0
             remaining = seconds_until_end_time(now, *end)
             if remaining <= 0:
@@ -238,11 +236,6 @@ def main():
             session_start = start
             deadline_ts = time.time() + remaining
             print(f"Recording until end-time ({remaining}s remaining)")
-
-    if args.defer_uploads and deadline_ts is None:
-        # Without an end-time the held clips would never be uploaded and would fill the SD card.
-        print("-v2 needs business hours (not --single / --ignore-hours / no window); uploading live instead")
-        args.defer_uploads = False
 
     pid_file = Path(__file__).resolve().parent / ".pid"
     # Only one recorder may own the camera. A second instance (at job, @reboot cron, start.sh,
@@ -263,10 +256,9 @@ def main():
             # with nothing scheduled, and a crash or reboot mid-session must not lose it either.
             # schedule_at() first drops any stale queue-'a' job (e.g. left from before a reboot).
             # Done after taking the lock so a rejected second instance can't replace the job.
-            schedule_at(session_start[0], session_start[1], Path(__file__).resolve(),
-                        extra_args=["-v2"] if args.defer_uploads else None)
+            schedule_at(session_start[0], session_start[1], Path(__file__).resolve())
         try:
-            recorder = VideoRecorder(args.config, imx500_overlay=args.imx500, defer_uploads=args.defer_uploads)
+            recorder = VideoRecorder(args.config, imx500_overlay=args.imx500)
 
             if args.single:
                 recorder.record_single_video()

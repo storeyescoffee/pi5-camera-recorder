@@ -120,7 +120,6 @@ class CloudUploader:
             self.recording_duration = int(self.config.get("recording", "duration_minutes"))
             self.bitrate = int(self.config.get("camera", "bitrate"))
             self.pending_uploads_csv = self.config.get("recording", "pending_uploads_csv", fallback="./pending_uploads.csv")
-            self.pending_retry_interval_minutes = int(self.config.get("recording", "pending_retry_interval_minutes", fallback="10"))
             # After this many genuine upload failures, stop retrying and move the clip to the
             # dead-letter store (failed_uploads_csv) instead of endlessly re-queueing it.
             # Raised to 5: 3 is too trigger-happy on a genuinely flaky link.
@@ -399,7 +398,7 @@ class CloudUploader:
                     f"[NET] Skipping rebounce (cooldown: {since:.0f}s < {self.network_rebounce_cooldown:.0f}s); "
                     "pending uploads will be retried later"
                 )
-                return  # leave _network_bounce_needed set; periodic retry handles leftovers
+                return  # leave _network_bounce_needed set; the next flush handles leftovers
             self._last_bounce_ts = now
             self._network_bounce_needed = False
             self._rebounce_network()
@@ -768,7 +767,8 @@ class CloudUploader:
         self._ensure_upload_executor_locked()
 
         # Dedup guard: never queue the same file while a prior/concurrent attempt is in flight
-        # (startup, periodic, and rebounce retries can otherwise queue the same clip twice).
+        # (the end-of-session flush, --reconcile, and rebounce retries can otherwise queue the
+        # same clip twice).
         with self._inflight_lock:
             if local_path in self._inflight:
                 self.logger.info(f"[UPLOAD] Already in flight, skipping duplicate queue: {filename}")
@@ -842,31 +842,33 @@ class CloudUploader:
                     self._inflight.discard(local_path)
 
     def defer_upload(self, local_path, s3_key, filename, start_time=None):
-        """-v2: park a finished clip in pending instead of uploading it during recording.
+        """Park a finished clip in pending instead of uploading it while the camera is running.
 
-        The pending row keeps the file safe from startup cleanup; upload_deferred() sends it
-        after business hours. start_time is re-derived from the file mtime at upload time.
+        TLS uploads compete with capture for CPU (the Pi 4 has no hardware AES), so every clip
+        is held and sent by upload_deferred() once the session ends and the camera is released.
+        The pending row also keeps the file safe from startup cleanup; start_time is re-derived
+        from the file mtime at upload time.
         """
         self._add_pending_upload(local_path, s3_key, filename)
-        self.logger.info(f"[DEFER] Holding upload until end of business hours: {filename}")
+        self.logger.info(f"[DEFER] Holding upload until the session ends: {filename}")
 
     def upload_deferred(self):
-        """Upload every clip parked by defer_upload() (plus any ordinary pending retries) and wait."""
-        self.logger.info("[DEFER] Uploading clips held during business hours...")
-        count = self.retry_pending_uploads(deferred_as_normal=True, wait_timeout=None)
+        """Upload every clip held by defer_upload() (plus any ordinary pending retries) and wait."""
+        self.logger.info("[DEFER] Uploading clips held during the session...")
+        count = self.retry_pending_uploads(wait_timeout=None)
         self.logger.info(f"[DEFER] Done. Uploaded {count} held clip(s).")
         return count
 
-    def retry_pending_uploads(self, deferred_as_normal=False, wait_timeout=600):
-        """Retry all uploads listed in pending_uploads.csv. Removes entries for missing files.
+    def retry_pending_uploads(self, wait_timeout=600):
+        """Upload everything listed in pending_uploads.csv. Removes entries for missing files.
         Clips that already failed max_pending_retries times are moved to the dead-letter store.
-        Uses UPLOADING_FALLBACK then COMPLETED_FALLBACK when retrying.
 
-        deferred_as_normal: rows never attempted (no video_code, attempts=0), i.e. held by -v2,
-        go through the normal UPLOADING/COMPLETED flow instead of the fallback statuses.
+        Rows never attempted (no video_code, attempts=0) are clips held during recording and go
+        through the normal UPLOADING/COMPLETED flow; a row that already failed an attempt is a
+        real retry and uses UPLOADING_FALLBACK then COMPLETED_FALLBACK.
         wait_timeout: seconds to wait for queued uploads (None = until all finish)."""
-        # Serialize retry passes — startup, the periodic loop, and the rebounce coordinator can
-        # all call this; overlapping passes would double-queue the same rows.
+        # Serialize passes — the end-of-session flush, --reconcile, and the rebounce
+        # coordinator can all call this; overlapping passes would double-queue the same rows.
         if not self._retry_lock.acquire(blocking=False):
             self.logger.info("[PENDING] Retry already in progress, skipping this pass")
             return 0
@@ -907,7 +909,7 @@ class CloudUploader:
                     self._remove_pending_upload(local_path)
                     continue
                 vc = (row.get("video_code") or "").strip() or None
-                is_fallback = not (deferred_as_normal and vc is None and attempts == 0)
+                is_fallback = not (vc is None and attempts == 0)
                 self.upload_file(local_path, s3_key, filename, is_fallback=is_fallback, video_code=vc, pending_attempts=attempts)
                 count += 1
             if count > 0:
